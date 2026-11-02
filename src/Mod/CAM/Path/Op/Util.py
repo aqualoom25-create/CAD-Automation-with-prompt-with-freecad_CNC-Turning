@@ -1,0 +1,753 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileCopyrightText: 2018 sliptonic <shopinthewoods@gmail.com>
+# SPDX-FileCopyrightText: 2021 Schildkroet
+# SPDX-FileNotice: Part of the FreeCAD project.
+
+################################################################################
+#                                                                              #
+#   FreeCAD is free software: you can redistribute it and/or modify            #
+#   it under the terms of the GNU Lesser General Public License as             #
+#   published by the Free Software Foundation, either version 2.1              #
+#   of the License, or (at your option) any later version.                     #
+#                                                                              #
+#   FreeCAD is distributed in the hope that it will be useful,                 #
+#   but WITHOUT ANY WARRANTY; without even the implied warranty                #
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                    #
+#   See the GNU Lesser General Public License for more details.                #
+#                                                                              #
+#   You should have received a copy of the GNU Lesser General Public           #
+#   License along with FreeCAD. If not, see https://www.gnu.org/licenses       #
+#                                                                              #
+################################################################################
+
+import FreeCAD
+import Path
+import Path.Base.Util as PathUtil
+import Path.Dressup.Utils as PathDressup
+import math
+import time
+import area
+
+# lazily loaded modules
+from lazy_loader.lazy_loader import LazyLoader
+
+Part = LazyLoader("Part", globals(), "Part")
+
+__title__ = "Util - Utility functions for CAM operations."
+__author__ = "sliptonic (Brad Collette)"
+__url__ = "https://www.freecad.org"
+__doc__ = "Collection of functions used by various operations. The functions are specific to CAM and the algorithms employed by CAM's operations."
+
+
+PrintWireDebug = False
+
+if False:
+    Path.Log.setLevel(Path.Log.Level.DEBUG, Path.Log.thisModule())
+    Path.Log.trackModule(Path.Log.thisModule())
+else:
+    Path.Log.setLevel(Path.Log.Level.INFO, Path.Log.thisModule())
+
+translate = FreeCAD.Qt.translate
+
+
+def debugEdge(label, e):
+    """debugEdge(label, e) ... prints a python statement to create e
+    Currently lines and arcs are supported."""
+    if not PrintWireDebug:
+        return
+    p0 = e.valueAt(e.FirstParameter)
+    p1 = e.valueAt(e.LastParameter)
+    if isinstance(e.Curve, Part.Line):
+        print(
+            "%s Part.makeLine((%.2f, %.2f, %.2f), (%.2f, %.2f, %.2f))"
+            % (label, p0.x, p0.y, p0.z, p1.x, p1.y, p1.z)
+        )
+    elif isinstance(e.Curve, Part.Circle):
+        r = e.Curve.Radius
+        c = e.Curve.Center
+        a = e.Curve.Axis
+        xu = e.Curve.AngleXU
+        if a.z < 0:
+            first = math.degrees(xu - e.FirstParameter)
+        else:
+            first = math.degrees(xu + e.FirstParameter)
+        last = first + math.degrees(e.LastParameter - e.FirstParameter)
+        print(
+            "%s Part.makeCircle(%.2f, App.Vector(%.2f, %.2f, %.2f), App.Vector(%.2f, %.2f, %.2f), %.2f, %.2f)"
+            % (label, r, c.x, c.y, c.z, a.x, a.y, a.z, first, last)
+        )
+    else:
+        print(
+            "%s %s (%.2f, %.2f, %.2f) -> (%.2f, %.2f, %.2f)"
+            % (label, type(e.Curve).__name__, p0.x, p0.y, p0.z, p1.x, p1.y, p1.z)
+        )
+
+
+def makeWires(inEdges):
+    """makeWires ... function to make non-forking wires from a collection of edges"""
+    edgelists = Part.sortEdges(inEdges)
+    result = [Part.Wire(e) for e in edgelists]
+    return result
+
+
+def debugWire(label, w):
+    """debugWire(label, w) ... prints python statements for all edges of w to be added to the object tree in a group."""
+    if not PrintWireDebug:
+        return
+    print("#%s wire >>>>>>>>>>>>>>>>>>>>>>>>" % label)
+    print("grp = FreeCAD.ActiveDocument.addObject('App::DocumentObjectGroup', '%s')" % label)
+    for i, e in enumerate(w.Edges):
+        edge = "%s_e%d" % (label, i)
+        debugEdge("%s = " % edge, e)
+        print("Part.show(%s, '%s')" % (edge, edge))
+        print("grp.addObject(FreeCAD.ActiveDocument.ActiveObject)")
+    print("#%s wire <<<<<<<<<<<<<<<<<<<<<<<<" % label)
+
+
+def getCoincideTolerance(edges):
+    """getCoincideTolerance(edges) ... Returns actual tolerance of edges connection in wire
+    Assumes the edges are in an order so they can be connected.
+    Return None if any edge length less than defined tolerance
+
+    Note:
+    Default tolerance of methods Part.sortEdges() and Part.__sortEdges__()
+    is Base.Precision.confusion() => 1e-7
+    """
+    tolerance = FreeCAD.Base.Precision.confusion()
+    for i in range(len(edges) - 1):
+        e1 = edges[i]
+        e1f = e1.valueAt(e1.FirstParameter)
+        e1l = e1.valueAt(e1.LastParameter)
+        e2 = edges[i + 1]
+        e2f = e2.valueAt(e2.FirstParameter)
+        e2l = e2.valueAt(e2.LastParameter)
+        pairs = ((e1l, e2f), (e1l, e2l), (e1f, e2f), (e1f, e2l))
+        dist = min((p2 - p1).Length for p1, p2 in pairs)
+        tolerance = max(dist, tolerance)
+
+    if any(e.Length < 2 * tolerance for e in edges):
+        Path.Log.error(
+            "Can not define tolerance edge connection. "
+            "One of the edge has length less than defined tolerance or edges not sorted."
+        )
+        return None
+
+    return tolerance
+
+
+def _orientEdges(inEdges):
+    """_orientEdges(inEdges) ... internal worker function to orient edges so the last vertex of one edge connects to the first vertex of the next edge.
+    Assumes the edges are in an order so they can be connected."""
+    Path.Log.track()
+
+    tol = getCoincideTolerance(inEdges)
+    if not tol:
+        return None
+
+    # orient all edges of the wire so each edge's last value connects to the next edge's first value
+    e0 = inEdges[0]
+    # well, even the very first edge could be misoriented, so let's try and connect it to the second
+    if 1 < len(inEdges):
+        last = e0.valueAt(e0.LastParameter)
+        e1 = inEdges[1]
+        if not Path.Geom.pointsCoincide(
+            last, e1.valueAt(e1.FirstParameter), tol
+        ) and not Path.Geom.pointsCoincide(last, e1.valueAt(e1.LastParameter), tol):
+            debugEdge("#  _orientEdges - flip first", e0)
+            e0 = Path.Geom.flipEdge(e0)
+
+    edges = [e0]
+    last = e0.valueAt(e0.LastParameter)
+    for e in inEdges[1:]:
+        ef = e.valueAt(e.FirstParameter)
+        edge = e if Path.Geom.pointsCoincide(last, ef, tol) else Path.Geom.flipEdge(e)
+        edges.append(edge)
+        last = edge.valueAt(edge.LastParameter)
+    return edges
+
+
+def _isWireClockwise(w):
+    """_isWireClockwise(w) ... return True if wire is oriented clockwise.
+    Assumes the edges of w are already properly oriented - for generic access use isWireClockwise(w).
+    """
+    # handle wires consisting of a single circle or 2 edges where one is an arc.
+    # in both cases, because the edges are expected to be oriented correctly, the orientation can be
+    # determined by looking at (one of) the circle curves.
+    if len(w.Edges) <= 2 and isinstance(w.Edges[0].Curve, Part.Circle):
+        return 0 > w.Edges[0].Curve.Axis.z
+    if len(w.Edges) == 2 and isinstance(w.Edges[1].Curve, Part.Circle):
+        return 0 > w.Edges[1].Curve.Axis.z
+
+    # for all other wires we presume they are polygonial and refer to Gauss
+    # https://en.wikipedia.org/wiki/Shoelace_formula
+    area = 0
+    for e in w.Edges:
+        v0 = e.valueAt(e.FirstParameter)
+        v1 = e.valueAt(e.LastParameter)
+        area = area + (v0.x * v1.y - v1.x * v0.y)
+    Path.Log.track(area)
+    return area < 0
+
+
+def isWireClockwise(w):
+    """isWireClockwise(w) ... returns True if the wire winds clockwise."""
+    return _isWireClockwise(Part.Wire(_orientEdges(w.Edges)))
+
+
+def orientWire(w, forward=True):
+    """orientWire(w, forward=True) ... orients given wire in a specific direction.
+    If forward = True (the default) the wire is oriented clockwise, looking down the negative Z axis.
+    If forward = False the wire is oriented counter clockwise.
+    If forward = None the orientation is determined by the order in which the edges appear in the wire.
+    """
+    Path.Log.debug("orienting forward: {}: {} edges".format(forward, len(w.Edges)))
+    wire = Part.Wire(_orientEdges(w.Edges))
+    if forward is not None:
+        if forward != _isWireClockwise(wire):
+            Path.Log.track("orientWire - needs flipping")
+            return Path.Geom.flipWire(wire)
+        Path.Log.track("orientWire - ok")
+    return wire
+
+
+def approximateWire(wire, tolerance=0.01):
+    """approximateWire approximates any non-line/arc edges with lines or arcs.
+    Edges that are lines or circular arcs are kept as-is.
+    tolerance: Deflection tolerance for approximation. Must be positive if wire contains non-line/arc edges.
+    Returns the wire with non-line/arc edges replaced by arcs and line segments.
+    """
+    processed_edges = []
+    modified = False
+    for edge in wire.Edges:
+        curve = edge.Curve
+        if isinstance(curve, (Part.Line, Part.LineSegment, Part.Circle, Part.ArcOfCircle)):
+            # Keep lines and arcs as-is
+            processed_edges.append(edge)
+        else:
+            # Approximate with lines and arcs
+            if tolerance <= 0:
+                raise ValueError(
+                    "tolerance parameter is required to be a positive value to approximate non-line/arc edges"
+                )
+            modified = True
+
+            # Convert to BSpline first if appropriate, to enable arc fitting
+            if isinstance(curve, (Part.Ellipse, Part.Hyperbola, Part.Parabola)):
+                # Convert edge to NURBS (BSpline)
+                shape = edge.toNurbs()
+                edge = shape.Edges[0]
+            elif isinstance(curve, Part.BezierCurve):
+                # Convert BezierCurve to BSpline
+                curve = edge.Curve.toBSpline()
+                edge = curve.toShape()
+
+            if isinstance(edge.Curve, Part.BSplineCurve):
+                # Convert BSpline to arcs
+                curve = edge.Curve
+                trimmed_curve = curve.trim(*edge.ParameterRange)
+                curves = trimmed_curve.toBiArcs(tolerance)
+                for curve in curves:
+                    processed_edges.append(curve.toShape())
+            else:
+                # For other curve types, fall back to discretization to line segments
+                vertices = edge.discretize(Deflection=tolerance)
+                line_edges = [
+                    Part.makeLine(vertices[i], vertices[i + 1]) for i in range(len(vertices) - 1)
+                ]
+                processed_edges.extend(line_edges)
+
+    # Reassemble the wire if any edges were replaced
+    if modified:
+        return Part.Wire(Part.__sortEdges__(processed_edges))
+    return wire
+
+
+def wireToCArea(wire, tolerance=0.01):
+    """wireToCArea(wire) ... converts a FreeCAD wire to a Clipper Area representation.
+
+    Parameters:
+        wire: Part.Wire to convert
+
+    Returns:
+        area.Area object containing a single curve representing the wire's geometry
+    """
+    a = area.Area()
+    c = area.Curve()
+
+    # Approximate wire as lines and arcs
+    wire = approximateWire(wire, tolerance)
+    edges = _orientEdges(Part.__sortEdges__(wire.Edges))
+
+    # Add the first point (start of first edge)
+    if len(edges) > 0:
+        first_point = edges[0].firstVertex().Point
+        c.append(area.Vertex(area.Point(first_point.x, first_point.y)))
+
+    # Process each edge, adding its endpoint
+    for i, edge in enumerate(edges):
+        curve = edge.Curve
+        p0 = edge.firstVertex().Point
+        p1 = edge.lastVertex().Point
+
+        if isinstance(curve, (Part.Line, Part.LineSegment)):
+            # Add endpoint as straight line vertex
+            c.append(area.Vertex(area.Point(p1.x, p1.y)))
+
+        elif isinstance(curve, Part.Circle):
+            center = curve.Center
+            direction = -1 if curve.Axis.z < 0 else 1
+
+            # Check if this is a full circle (start == end)
+            if Path.Geom.pointsCoincide(p0, p1):
+                # Full circle - split into two semicircles
+                # Find the midpoint opposite the start point
+                mid_x = center.x - (p0.x - center.x)
+                mid_y = center.y - (p0.y - center.y)
+                midpoint = FreeCAD.Vector(mid_x, mid_y, p0.z)
+                c.append(
+                    area.Vertex(
+                        direction,
+                        area.Point(midpoint.x, midpoint.y),
+                        area.Point(center.x, center.y),
+                    )
+                )
+                c.append(
+                    area.Vertex(direction, area.Point(p1.x, p1.y), area.Point(center.x, center.y))
+                )
+            else:
+                # Regular arc - add as single vertex
+                c.append(
+                    area.Vertex(direction, area.Point(p1.x, p1.y), area.Point(center.x, center.y))
+                )
+        else:
+            raise TypeError(f"Unsupported curve type: {type(curve).__name__}")
+
+    a.append(c)
+    return a
+
+
+def cAreaToWires(carea, z=0.0, tolerance=0.01):
+    """cAreaToWires(carea, z, tolerance) ... converts a Clipper Area to FreeCAD wires.
+
+    Parameters:
+        carea: area.Area object to convert
+        z: Z-coordinate for the wires (default: 0.0)
+        tolerance: Tolerance to set on vertices (default: 0.01)
+
+    Returns:
+        list of Part.Wire objects
+    """
+    wires = []
+
+    # Get clipper scale for line segment tolerance
+    line_tolerance = math.sqrt(2) / area.get_clipper_scale()
+
+    # Process each curve in the area
+    for curve in carea.getCurves():
+        edges = []
+        vertices = curve.getVertices()
+
+        if len(vertices) < 2:
+            continue
+
+        # Process each segment
+        v0 = None
+        for i in range(len(vertices)):
+            v1 = vertices[i]
+            if v0 is None:
+                v0 = v1
+                continue
+
+            p0 = FreeCAD.Vector(v0.p.x, v0.p.y, z)
+            p1 = FreeCAD.Vector(v1.p.x, v1.p.y, z)
+
+            if v1.type == 0:
+                # Straight line segment
+                edge = Part.LineSegment(p0, p1).toShape()
+                # Set tolerance on line segment vertices
+                for vertex in edge.Vertexes:
+                    vertex.Tolerance = line_tolerance
+                edges.append(edge)
+            else:
+                # Arc: type == 1 for CCW, type == -1 for CW
+                center = FreeCAD.Vector(v1.c.x, v1.c.y, z)
+                if i + 1 < len(vertices):
+                    v2 = vertices[i + 1]
+                    if v2.type == v1.type and v2.c.x == v1.c.x and v2.c.y == v1.c.y:
+                        # merge arcs of the same circle and same direction
+                        continue
+
+                radius = (p0 - center).Length
+
+                # Create the circle. For axis direction, CCW is +Z and CW is -Z, matching type
+                axis = FreeCAD.Vector(0, 0, v1.type)
+                circle = Part.Circle(center, axis, radius)
+
+                # Compute start/end angles in the circle's parameterization, and create the arc
+                xdir = circle.XAxis
+                ydir = circle.YAxis
+                d0 = p0 - center
+                d1 = p1 - center
+                angle0 = math.atan2(d0.dot(ydir), d0.dot(xdir))
+                angle1 = math.atan2(d1.dot(ydir), d1.dot(xdir))
+                if angle1 == angle0:
+                    angle1 += 2 * math.pi
+                edge = Part.ArcOfCircle(circle, angle0, angle1).toShape()
+
+                # Set tolerance on arc vertices
+                for vertex in edge.Vertexes:
+                    vertex.Tolerance = tolerance
+
+                edges.append(edge)
+
+            v0 = v1
+
+        if edges:
+            wire = Part.Wire(edges)
+            wires.append(wire)
+
+    return wires
+
+
+def offsetWire(wire, base, offset, tolerance=0.01):
+    """offsetWire performs an open path offset using Clipper library.
+
+    tolerance: Deflection tolerance for discretization. Must be positive
+
+    Note that there is also offsetWireCompat, which is a direct migration of
+    the old offsetWire implementation. This version makes simpler choices
+    about the direction in which it offsets, and the orientation of its result curves.
+
+    return: (pos_wires, neg_wires): the wires resulting from performing the requested
+    open wire offset, and the negative of the requested offset. If the input wire is
+    open, all output wires are oriented in the same direction as the input. If it is
+    closed, output orientation will match the input if the input encloses positive
+    area, and be flipped if the input encloses negative area. (Future note: if this
+    flipping behavior is undesirable, we'll need a new flag to disable it in the C++
+    implementation. It was needed in C++ for compatibility with old behavior.)
+    """
+    if len(wire.Edges) == 0:
+        return [], []
+
+    debugWire("wire", wire)
+
+    # Store original accuracy and set to tolerance for better precision
+    original_accuracy = area.get_accuracy()
+    try:
+        area.set_accuracy(min(original_accuracy, tolerance))
+
+        # Convert wire to CArea, and offset
+        posArea = wireToCArea(wire, tolerance)
+        negArea = posArea.OpenOffset(offset)
+
+        # Convert back to FreeCAD wires
+        z = wire.Edges[0].Vertexes[0].Point.z
+        pos_wires = cAreaToWires(posArea, z, tolerance)
+        neg_wires = cAreaToWires(negArea, z, tolerance)
+
+        # Show debug wires, if in debug mode
+        for i, w in enumerate(pos_wires):
+            debugWire(f"positiveOffset_{i}", w)
+
+        for i, w in enumerate(neg_wires):
+            debugWire(f"negativeOffset_{i}", w)
+
+        # Return
+        return pos_wires, neg_wires
+
+    finally:
+        # Restore original accuracy
+        area.set_accuracy(original_accuracy)
+
+
+def offsetWireCompat(wire, base, offset, Side=None, tolerance=0.01):
+    """offsetWire performs an open path offset using Clipper library.
+
+    tolerance: Deflection tolerance for discretization. Must be positive
+
+    offsetWireCompat is a direct migration of the old offsetWire implementation.
+    It preserves old decisions about how the offset side is chosen, and the orientation
+    of output wires. Some of these choices are poor choices, imo, so I have also
+    implemented an alternative offsetWire function with that simply does type
+    conversions and connects to the C++ open wire offset functionality.
+
+    Compat offset side: this method tries to automatically detect which offset
+    direction is into the part and which direction is outside the part, and returns
+    the outside-direction offset, regardless of the sign of the offset parameter.
+
+    Compat result orientation: for the most part, results are returned in the correct
+    orientation for climb cutting an offset path. This means that external offsets
+    are clockwise, and internal offsets are counterclockwise. However, to preserve
+    old behavior, single-edge circular wires are always returned in the clockwise
+    orientation. I think this is a bug that should be fixed. Also I think the caller
+    ought to be able to choose if the output wires are oriented for climb cutting (or
+    conventional) or if they should be oriented correctly for positive winding rules.
+    """
+    debugWire("wire", wire)
+
+    # Store original accuracy and set to tolerance for better precision
+    original_accuracy = area.get_accuracy()
+    try:
+        area.set_accuracy(min(original_accuracy, tolerance))
+
+        # Convert wire to Clipper area, and offset
+        # Positive offset is in carea; negative offset in neg
+        carea = wireToCArea(wire, tolerance)
+        neg = carea.OpenOffset(offset)
+
+        # Convert back to FreeCAD wires
+        z_coord = wire.Edges[0].Vertexes[0].Point.z
+        result_wires = cAreaToWires(carea, z_coord, tolerance)
+
+        for i, w in enumerate(result_wires):
+            debugWire(f"positiveOffset_{i}", w)
+
+        # Flip all the wires backwards for compatibility with the old implementation of offsetWire
+        # I think the nominal spec is that this returns the climb cutting tool path of an offset edge
+        result_wires = [Path.Geom.flipWire(w) for w in result_wires]
+
+        if not result_wires:
+            return []
+
+        # Check if the offset went in the right direction
+        # This is a modification of the original brittle test in the old offsetWire. Instead of checking
+        # isInside, it checks the distance to the shape. Hopefully it's less brittle
+        #
+        # I stopped iterating on this modification when it worked, but if it turns out to not be enough
+        # I think it would be better to compute dts on a point from each side, and if one of them is
+        # smaller (by at least the tolerance?) then that side is the inside direction
+        test_edge = result_wires[0].Edges[0]
+        test_point = test_edge.valueAt((test_edge.FirstParameter + test_edge.LastParameter) / 2)
+        dts = Part.Vertex(test_point).distToShape(base)[0]
+        is_inside = dts < abs(offset / 2) - tolerance
+
+        if is_inside:
+            # Offset went the wrong way - use original carea and offset in opposite direction
+            carea = neg
+            result_wires = cAreaToWires(carea, z_coord, tolerance)
+
+            for i, w in enumerate(result_wires):
+                debugWire(f"negativeOffset_{i}", w)
+
+            # This is the hack to always return single-edge circular wires in the clockwise orientation
+            # It exists for compatibility with the old behavior, but should probably be deleted in another PR
+            result_wires = [
+                (
+                    Path.Geom.flipWire(w)
+                    if len(w.Edges) == 1 and isinstance(w.Edges[0].Curve, Part.Circle)
+                    else w
+                )
+                for w in result_wires
+            ]
+
+        if Side is not None:
+            Side[0] = "Inside" if is_inside else "Outside"
+
+        # Return the chosen wires
+        return result_wires
+    finally:
+        # Restore original accuracy
+        area.set_accuracy(original_accuracy)
+
+
+def getClearedAreas(currentOp, bbox):
+    """
+    Returns the cleared area relevant to the operation
+    - currentOp: the operation we are checking for. Only operations performed
+      before this operation will be considered
+    - bbox: the cleared region is only generated where it is close enough to
+      impact the bbox region, given in currentOp's frame
+
+    Every operation's path is stored in its own work plane's frame, with
+    obj.Placement positioning it. Operations whose tool axis differs from the
+    current one are skipped: projecting cleared area between non-coplanar
+    frames has no 2D meaning. Operations that share the tool axis may still
+    sit on parallel planes at different depths or with different in-plane
+    origins, so each one's path is carried into the current operation's frame
+    by the relative placement before its cleared area is computed, and the
+    result is already in the caller's frame. Sharing a tool axis makes that
+    relative placement a rotation about Z plus a translation, which the path
+    representation carries exactly, arcs included. (Path.Area has no
+    transform, so the path is moved rather than the area.)
+    """
+    clearedAreas = []
+    job = currentOp.Proxy.job
+    tol = job.GeometryTolerance.getValueAs("mm")
+    currentFrame = PathUtil.workplaneForOp(currentOp)
+    for op in job.Operations.Group:
+        baseOp = PathDressup.baseOp(op)
+        if baseOp.Name == currentOp.Name:
+            break
+        if getattr(op, "RestMachiningPass", None):
+            op = baseOp
+        if not (getattr(baseOp, "Active", False) and op.Path):
+            continue
+        otherFrame = PathUtil.workplaneForOp(baseOp)
+        if not PathUtil.sameWorkplane(otherFrame, currentFrame):
+            continue
+
+        # other frame -> current frame
+        toCurrent = currentFrame.inverse().multiply(otherFrame)
+        path = op.Path
+        if not toCurrent.isIdentity(1e-9):
+            path = PathUtil.applyPlacementToPath(toCurrent, path)
+
+        tool = baseOp.ToolController.Tool
+        diameter = tool.Diameter.getValueAs("mm")
+        # for drills, dz translates to the full width part of the tool
+        dz = 0 if not hasattr(tool, "TipAngle") else -drillTipLength(tool)
+        clearedAreas.append(path.getClearedArea(diameter, bbox.ZMin + tol + dz, bbox))
+    return clearedAreas
+
+
+def getOpSide(obj, default="Outside"):
+    """getOpSide(obj) ...  offer side for op base"""
+
+    def getVerticalFaces(edges, shape):
+        """Returns vertical faces (wall around) that contains given edges
+        Excludes faces which is longer than common edges"""
+        vFaces = []
+        for f in shape.Faces:
+            if len(vFaces) == len(edges):
+                break
+            if isHorizontal(f):
+                continue
+            for hEdge in edges:
+                hsh = hEdge.hashCode()
+                if any(hsh == e.hashCode() for e in f.Edges) and all(
+                    e.Length < hEdge.Length or isRoughly(hEdge.Length, e.Length)
+                    for e in f.Edges
+                    if isHorizontal(e)
+                ):
+                    vFaces.append(f)
+                    edges.remove(hEdge)
+                    break
+        return vFaces
+
+    if not obj.Base:
+        return default
+    isRoughly = Path.Geom.isRoughly
+    isHorizontal = Path.Geom.isHorizontal
+    base, subNames = obj.Base[0]
+    shape = base.Shape
+    frame = PathUtil.workplaneForOp(obj)
+    if not frame.isIdentity(1e-9):
+        shape = shape.transformed(frame.inverse().toMatrix())
+    if "Face" in subNames[0]:
+        faces = [shape.getElement(sub) for sub in subNames if sub.startswith("Face")]
+        vFaces = []
+        hFaces = []
+        for face in faces:
+            if isHorizontal(face):
+                hFaces.append(face)
+            else:
+                vFaces.append(face)
+        if vFaces:
+            volume = Part.Compound(vFaces).Volume
+            if volume > 0 or isRoughly(volume, 0):
+                return "Outside"
+            # check if vertical faces creates a closed area
+            fzMin = min(e.BoundBox.ZMin for f in vFaces for e in f.Edges)
+            if bEdges := [e for f in vFaces for e in f.Edges if isRoughly(e.BoundBox.ZMax, fzMin)]:
+                wire = Part.Wire(Part.__sortEdges__(bEdges))
+                if not wire.isClosed():  # for open area always offer 'Outside'
+                    return "Outside"
+            return "Inside"  # negative volume forms inner area
+        if hFaces:
+            vFaces = getVerticalFaces(hFaces[0].OuterWire.Edges, shape)
+            volume = Part.Compound(vFaces).Volume
+            if volume < 0 and not isRoughly(volume, 0):  # negative volume forms inner area
+                return "Inside"
+            else:
+                return "Outside"
+    elif "Edge" in subNames[0]:
+        edges = [shape.getElement(sub) for sub in subNames if sub.startswith("Edge")]
+        cluster = Part.getSortedClusters(edges)[0]
+        wire = Part.Wire(Part.__sortEdges__(cluster))
+        if not wire.isClosed():  # for open wire always offer 'Outside'
+            return "Outside"
+        vFaces = getVerticalFaces(edges, shape)
+        volume = Part.Compound(vFaces).Volume
+        if volume < 0 and not isRoughly(volume, 0):  # negative volume forms inner area
+            return "Inside"
+        else:
+            return "Outside"
+
+    return default
+
+
+def getCycleTimeEstimate(obj, formatted=True):
+    """getCycleTimeEstimate(obj, formated=True) ... Returns operation cycle time estimation
+    If formatted=True returns string which describes time in format 'hh:mm:ss'
+    If formatted=False returns seconds as a float value"""
+    if obj.Path.Length == 0:
+        return "0" if formatted else 0
+
+    tc = PathDressup.toolController(obj)
+    if tc is None or tc.ToolNumber == 0:
+        Path.Log.error(translate("CAM", "No Tool Controller selected."))
+        return translate("CAM", "Tool Error")
+
+    hFeedrate = tc.HorizFeed.Value
+    vFeedrate = tc.VertFeed.Value
+    hRapidrate = tc.HorizRapid.Value
+    vRapidrate = tc.VertRapid.Value
+
+    if hFeedrate == 0 or vFeedrate == 0:
+        if not Path.Preferences.suppressAllSpeedsWarning():
+            Path.Log.warning(
+                translate(
+                    "CAM",
+                    "Tool Controller feedrates required to calculate the cycle time.",
+                )
+            )
+        return translate("CAM", "Tool Feedrate Error")
+
+    if (hRapidrate == 0 or vRapidrate == 0) and not Path.Preferences.suppressRapidSpeedsWarning():
+        Path.Log.warning(
+            translate(
+                "CAM",
+                "Add Tool Controller Rapid Speeds on the SetupSheet for more accurate cycle times.",
+            )
+        )
+
+    # Get the cycle time in seconds
+    seconds = obj.Path.getCycleTime(hFeedrate, vFeedrate, hRapidrate)
+
+    if math.isnan(seconds):
+        return translate("CAM", "Cycletime Error")
+
+    if formatted:  # Convert the cycle time to a HH:MM:SS format
+        return time.strftime("%H:%M:%S", time.gmtime(seconds))
+    else:
+        return seconds
+
+
+def drillTipLength(tool):
+    """returns the length of the drillbit tip. Tools without a TipAngle (e.g. an
+    endmill, used to drill/plunge a hole) have no cone to compensate for, so this
+    is a normal case, not an error -- 0.0 is the correct length, not a fallback."""
+
+    if not hasattr(tool, "TipAngle"):
+        Path.Log.debug(translate("Path", "Selected tool has no TipAngle, treating as 0"))
+        return 0.0
+
+    angle = tool.TipAngle
+
+    if angle <= 0 or angle >= 180:
+        Path.Log.error(
+            translate("Path", "Invalid Cutting Edge Angle %.2f, must be >0° and <=180°") % angle
+        )
+        return 0.0
+
+    theta = math.radians(angle)
+    length = (float(tool.Diameter) / 2) / math.tan(theta / 2)
+
+    if length < 0:
+        Path.Log.error(
+            translate("Path", "Cutting Edge Angle (%.2f) results in negative tool tip length")
+            % angle
+        )
+        return 0.0
+
+    return length

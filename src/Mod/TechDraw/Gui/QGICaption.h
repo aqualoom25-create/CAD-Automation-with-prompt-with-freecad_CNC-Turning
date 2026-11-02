@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+/***************************************************************************
+ *   Copyright (c) 2016 WandererFan <wandererfan@gmail.com>                *
+ *                                                                         *
+ *   This file is part of the FreeCAD CAx development system.              *
+ *                                                                         *
+ *   This library is free software; you can redistribute it and/or         *
+ *   modify it under the terms of the GNU Library General Public           *
+ *   License as published by the Free Software Foundation; either          *
+ *   version 2 of the License, or (at your option) any later version.      *
+ *                                                                         *
+ *   This library  is distributed in the hope that it will be useful,      *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU Library General Public License for more details.                  *
+ *                                                                         *
+ *   You should have received a copy of the GNU Library General Public     *
+ *   License along with this library; see the file COPYING.LIB. If not,    *
+ *   write to the Free Software Foundation, Inc., 59 Temple Place,         *
+ *   Suite 330, Boston, MA  02111-1307, USA                                *
+ *                                                                         *
+ ***************************************************************************/
+
+#pragma once
+
+#include <Mod/TechDraw/TechDrawGlobal.h>
+
+#include "QGCustomText.h"
+#include "QGIUserTypes.h"
+
+namespace TechDraw
+{
+class DrawView;
+}
+
+namespace TechDrawGui
+{
+
+class TechDrawGuiExport QGICaption : public QGCustomText
+{
+public:
+    explicit QGICaption();
+    ~QGICaption() override {}
+
+    enum {Type = UserType::QGICaption};
+    int type() const override { return Type;}
+
+    bool m_isEditing = false;
+
+    // Page layout calls setPos to place the caption. That must not write
+    // CaptionSnap / CaptionLocation or opening a drawing marks the document
+    // modified. User drags still persist (default true).
+    void setPersistOnMove(bool enable) { m_persistOnMove = enable; }
+
+protected:
+    QVariant itemChange(GraphicsItemChange change, const QVariant &value) override;
+    QPointF snapToView(QPointF pos);
+    void mouseDoubleClickEvent(QGraphicsSceneMouseEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+
+private:
+    void setEditMode(bool enable);
+    void setCaptionSnapIfChanged(TechDraw::DrawView* viewObj, const char* snapName);
+
+    bool m_persistOnMove = true;
+};
+
+}

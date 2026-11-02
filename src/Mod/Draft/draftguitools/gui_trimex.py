@@ -1,0 +1,748 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+# ***************************************************************************
+# *   (c) 2009, 2010 Yorik van Havre <yorik@uncreated.net>                  *
+# *   (c) 2009, 2010 Ken Cline <cline@frii.com>                             *
+# *   (c) 2020 Eliud Cabrera Castillo <e.cabrera-castillo@tum.de>           *
+# *                                                                         *
+# *   This file is part of the FreeCAD CAx development system.              *
+# *                                                                         *
+# *   This program is free software; you can redistribute it and/or modify  *
+# *   it under the terms of the GNU Lesser General Public License (LGPL)    *
+# *   as published by the Free Software Foundation; either version 2 of     *
+# *   the License, or (at your option) any later version.                   *
+# *   for detail see the LICENCE text file.                                 *
+# *                                                                         *
+# *   FreeCAD is distributed in the hope that it will be useful,            *
+# *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+# *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+# *   GNU Library General Public License for more details.                  *
+# *                                                                         *
+# *   You should have received a copy of the GNU Library General Public     *
+# *   License along with FreeCAD; if not, write to the Free Software        *
+# *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  *
+# *   USA                                                                   *
+# *                                                                         *
+# ***************************************************************************
+"""Provides GUI tools to trim and extend lines and extrude faces."""
+
+## @package gui_trimex
+# \ingroup draftguitools
+# \brief Provides GUI tools to trim and extend lines.
+
+## \addtogroup draftguitools
+# @{
+import math
+from PySide.QtCore import QT_TRANSLATE_NOOP
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import DraftVecUtils
+from draftfunctions import extrude
+from draftgeoutils import general as geo_general
+from draftgeoutils import intersections as geo_intersections
+from draftguitools import gui_base_original
+from draftguitools import gui_tool_utils
+from draftguitools import gui_trackers as trackers
+from draftutils import gui_utils
+from draftutils import params
+from draftutils import utils
+from draftutils.messages import _msg, _err, _toolmsg, _wrn
+from draftutils.translate import translate
+
+
+def _get_global_shape(obj, subname=""):
+    """Return an object's shape transformed through its container chain."""
+    import Part
+
+    return Part.getShape(obj, subname, needSubElement=bool(subname), noElementMap=True)
+
+
+def _resolve_selection(sel):
+    """Return the selected object, its global placement, and its shape."""
+    subname = sel.SubElementNames[0] if sel.SubElementNames else ""
+    component = subname.rpartition(".")[2]
+    if component.startswith(("Edge", "Face", "Vertex")):
+        subname = subname.rpartition(".")[0]
+        if subname:
+            subname += "."
+    obj = sel.Object.getSubObject(subname, 1) if subname else sel.Object
+    placement = sel.Object.getSubObject(subname, 3)
+    shape = _get_global_shape(sel.Object, subname)
+    return obj, placement, shape
+
+
+class Trimex(gui_base_original.Modifier):
+    """Gui Command for the Trimex tool.
+
+    This tool trims or extends lines, wires and arcs.
+
+    SHIFT constrains to the active endpoint.
+    """
+
+    command_name = QT_TRANSLATE_NOOP("draft", "Trimex")
+    selection_message = QT_TRANSLATE_NOOP("draft", "Select objects to trim or extend")
+
+    def GetResources(self):
+        """Set icon, menu and tooltip."""
+
+        return {
+            "Pixmap": "Draft_Trimex",
+            "Accel": "T, R",
+            "MenuText": QT_TRANSLATE_NOOP("Draft_Trimex", "Trimex"),
+            "ToolTip": QT_TRANSLATE_NOOP("Draft_Trimex", "Trims or extends the selected object"),
+        }
+
+    def Activated(self):
+        """Execute when the command is called."""
+        super().Activated(name=self.command_name)
+        self.edges = []
+        self.placement = None
+        self.ghost = []
+        self.linetrack = None
+        self.color = None
+        self.width = None
+        self.axisSetter = None
+        self.axisEndpoints = None
+        self.lockedActivePoint = None
+        self.extrudeMode = False
+        self.extrudeBase = None
+        self.extrudeShape = None
+        if self.ui:
+            if not Gui.Selection.getSelection():
+                self.ui.selectUi(on_close_call=self.finish)
+                _msg(translate("draft", self.selection_message))
+                self.call = self.view.addEventCallback("SoEvent", gui_tool_utils.selectObject)
+            else:
+                self.proceed()
+
+    def proceed(self):
+        """Proceed with execution of the command after proper selection."""
+        if self.call:
+            self.view.removeEventCallback("SoEvent", self.call)
+        selection = Gui.Selection.getSelection()
+        if len(selection) == 2:
+            self.trimObjects(selection)
+            self.finish()
+            return
+        sel = Gui.Selection.getSelectionEx("", 0)[0]
+        self.obj, self.placement, selected_shape = _resolve_selection(sel)
+
+        if self._setupObjectTrimex(sel):
+            return
+
+        reason = utils.get_trimex_unsupported_reason(self.obj)
+        if reason:
+            self.obj = None
+            self.finish()
+            _err(reason)
+            return
+        self._startWireTrimex(selected_shape)
+
+    def _startWireTrimex(self, shape=None):
+        """Set up the common trim/extend interaction for editable edges."""
+        import Part
+
+        self.ui.trimUi(title=translate("draft", self.featureName))
+        self.linetrack = trackers.lineTracker()
+        if shape is None:
+            shape = _get_global_shape(self.obj)
+        if shape.Wires:
+            self.edges = shape.Wires[0].Edges
+            self.edges = Part.__sortEdges__(self.edges)
+        else:
+            self.edges = shape.Edges
+        for edge in self.edges:
+            if isinstance(edge.Curve, (Part.BSplineCurve, Part.BezierCurve)):
+                self.obj = None
+                self.finish()
+                _err(translate("draft", "Trimex does not support this object type"))
+                return
+        self.color = self.obj.ViewObject.LineColor
+        self.width = self.obj.ViewObject.LineWidth
+        self.obj.ViewObject.LineColor = (0.5, 0.5, 0.5)
+        self.obj.ViewObject.LineWidth = 1
+        self.ghost = []
+        line_color = (self.color[0], self.color[1], self.color[2])
+        for edge in self.edges:
+            if geo_general.geomType(edge) == "Line":
+                self.ghost.append(trackers.lineTracker(scolor=line_color, swidth=self.width))
+            else:
+                self.ghost.append(trackers.arcTracker(scolor=line_color, swidth=self.width))
+        self._startInteraction()
+
+    def _startInteraction(self):
+        """Start the shared point-picking interaction for the active mode."""
+        if not self.ghost:
+            self.obj = None
+            self.finish()
+            return
+        for g in self.ghost:
+            g.on()
+        self.activePoint = 0
+        self.reverse = False
+        self.nodes = []
+        self.shift = False
+        self.alt = False
+        self.force = None
+        self.cv = None
+        self.call = self.view.addEventCallback("SoEvent", self.action)
+        _toolmsg(translate("draft", "Pick distance"))
+        self.selection_done = True
+        self.update_hints()
+
+    def _startFaceExtrude(self, sel):
+        """Set up face extrusion without creating document objects yet."""
+        source = sel.Object
+        if not hasattr(source, "Shape"):
+            self.obj = None
+            self.finish()
+            _err(translate("draft", "Select a single face to extrude"))
+            return
+        shape = source.Shape
+        if len(shape.Faces) == 1:
+            self.extrudeBase = source
+            self.extrudeShape = shape
+        elif len(sel.SubObjects) == 1 and sel.SubObjects[0].ShapeType == "Face":
+            self.extrudeShape = sel.SubObjects[0]
+        else:
+            self.obj = None
+            self.finish()
+            _err(translate("draft", "Only a single face can be extruded"))
+            return
+
+        self.obj = source
+        self.extrudeMode = True
+        self.normal = self.extrudeShape.Faces[0].normalAt(0.5, 0.5)
+        self.ghost = [trackers.ghostTracker(self.extrudeShape), trackers.lineTracker(dotted=True)]
+        self.ghost += [trackers.lineTracker() for _ in self.extrudeShape.Vertexes]
+        self.ui.trimUi(title=translate("draft", self.featureName))
+        self.linetrack = trackers.lineTracker()
+        self._startInteraction()
+
+    def _setupObjectTrimex(self, sel):
+        """Allow workbenches to support their own parametric objects."""
+        return False
+
+    def _setupAxisTrimex(self, face, points, axes, setter):
+        """Use the Trimex interaction to edit a parametric axis."""
+        import Part
+
+        end = self._getEndFace(face, points, axes)
+        if end is None:
+            return False
+
+        self.axisSetter = setter
+        self.axisEndpoints = points
+        self.lockedActivePoint = end
+        span = points[0].distanceToPoint(points[1])
+        inner = points[end] - axes[end] * span
+        if end:
+            self.edges = [Part.makeLine(inner, points[end])]
+        else:
+            self.edges = [Part.makeLine(points[end], inner)]
+        self.placement = None
+        self.ghost = [trackers.lineTracker(scolor=(0.5, 0.5, 0.5), swidth=1)]
+        self.ui.trimUi(title=translate("draft", self.featureName))
+        self.linetrack = trackers.lineTracker()
+        self._startInteraction()
+        return True
+
+    def _getEndFace(self, face, points, axes):
+        """Return the selected end of an axis, or None for a side face."""
+        center = face.CenterOfMass
+        normal = face.normalAt(0, 0)
+        normal.normalize()
+        for i, point in enumerate(points):
+            aligned = abs(normal.dot(axes[i])) > 0.95
+            on_face = abs(normal.dot(point.sub(center))) <= face.Tolerance
+            if aligned and on_face:
+                return i
+        return None
+
+    def action(self, arg):
+        """Handle the 3D scene events.
+
+        This is installed as an EventCallback in the Inventor view.
+
+        Parameters
+        ----------
+        arg: dict
+            Dictionary with strings that indicates the type of event received
+            from the 3D view.
+        """
+        if arg["Type"] == "SoKeyboardEvent":
+            if arg["Key"] == "ESCAPE":
+                self.finish()
+        elif not self.ui.mouse:
+            pass
+        elif arg["Type"] == "SoLocation2Event":  # mouse movement detection
+            self.shift = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_constrain_key())
+            self.alt = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_alt_key())
+            self.ctrl = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_snap_key())
+            if self.extrudeMode:
+                arg["ShiftDown"] = False
+            elif hasattr(Gui, "Snapper"):
+                Gui.Snapper.setSelectMode(not self.ctrl)
+            self.point, cp, info = gui_tool_utils.getPoint(self, arg)
+            if gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_snap_key()):
+                self.snapped = None
+            else:
+                self.snapped = self.view.getObjectInfo((arg["Position"][0], arg["Position"][1]))
+            if self.extrudeMode:
+                dist, ang = (self.extrude(self.shift), None)
+            else:
+                # If the geomType of the edge is "Line" ang will be None,
+                # else dist will be None.
+                dist, ang = self.redraw(self.point, self.snapped, self.shift, self.alt)
+
+            if dist:
+                self.ui.labelRadius.setText(translate("draft", "Distance"))
+                self.ui.radiusValue.setToolTip(translate("draft", "Offset distance"))
+                self.ui.setRadiusValue(dist, unit="Length")
+            elif ang:
+                self.ui.labelRadius.setText(translate("draft", "Angle"))
+                self.ui.radiusValue.setToolTip(translate("draft", "Offset angle"))
+                self.ui.setRadiusValue(ang, unit="Angle")
+            else:
+                # both dist and ang are None, this indicates an impossible
+                # situation. Setting 0 with no unit will show "0 ??" and not
+                # compute any value
+                self.ui.setRadiusValue(0)
+            self.ui.setFocus("radius")
+            gui_tool_utils.redraw3DView()
+
+        elif arg["Type"] == "SoMouseButtonEvent":
+            if (arg["State"] == "DOWN") and (arg["Button"] == "BUTTON1"):
+                cursor = arg["Position"]
+                self.shift = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_constrain_key())
+                self.alt = gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_alt_key())
+                if gui_tool_utils.hasMod(arg, gui_tool_utils.get_mod_snap_key()):
+                    self.snapped = None
+                else:
+                    self.snapped = self.view.getObjectInfo((cursor[0], cursor[1]))
+                self.trimObject()
+                self.finish()
+
+    def extrude(self, shift=False, real=False):
+        """Redraw the ghost in extrude mode."""
+        self.newpoint = self.extrudeShape.Faces[0].CenterOfMass
+        dvec = self.point.sub(self.newpoint)
+        if not shift:
+            delta = DraftVecUtils.project(dvec, self.normal)
+            if delta.Length < 1e-7:
+                # Use the normal if self.newpoint is coplanar with the face:
+                delta = self.normal * dvec.Length
+        else:
+            delta = dvec
+        if self.force and delta.Length:
+            ratio = self.force / delta.Length
+            delta.multiply(ratio)
+        if real:
+            return delta
+        self.ghost[0].trans.translation.setValue([delta.x, delta.y, delta.z])
+        # Update the dotted lineTracker:
+        self.ghost[1].p1(self.newpoint)
+        self.ghost[1].p2(self.newpoint + dvec)
+        # Update the vertex lineTrackers:
+        for i in range(2, len(self.ghost)):
+            base = self.extrudeShape.Vertexes[i - 2].Point
+            self.ghost[i].p1(base)
+            self.ghost[i].p2(base + delta)
+        return delta.Length
+
+    def redraw(self, point, snapped=None, shift=False, alt=False, real=None):
+        """Redraw the ghost normally."""
+        # initializing
+        reverse = False
+        for g in self.ghost:
+            g.off()
+        if real:
+            newedges = []
+
+        import Part
+
+        # finding the active point
+        vlist = []
+        for e in self.edges:
+            vlist.append(e.Vertexes[0].Point)
+        vlist.append(self.edges[-1].Vertexes[-1].Point)
+        if self.lockedActivePoint is not None:
+            npoint = self.lockedActivePoint
+        elif shift:
+            npoint = self.activePoint
+        else:
+            npoint = geo_general.findClosest(point, vlist)
+        if npoint > len(self.edges) / 2:
+            reverse = True
+        if alt and self.lockedActivePoint is None:
+            reverse = not reverse
+        self.activePoint = npoint
+        self.reverse = reverse
+
+        # sorting out directions
+        if reverse and (npoint > 0):
+            npoint = npoint - 1
+        if npoint > len(self.edges) - 1:
+            edge = self.edges[-1]
+            ghost = self.ghost[-1]
+        else:
+            edge = self.edges[npoint]
+            ghost = self.ghost[npoint]
+        if reverse:
+            v1 = edge.Vertexes[-1].Point
+            v2 = edge.Vertexes[0].Point
+        else:
+            v1 = edge.Vertexes[0].Point
+            v2 = edge.Vertexes[-1].Point
+
+        # snapping
+        if snapped:
+            parent = snapped.get("ParentObject", None)
+            if parent:
+                subname = snapped["SubName"]
+            else:
+                parent = self.doc.getObject(snapped["Object"])
+                subname = snapped["Component"]
+            shape = _get_global_shape(parent, subname)
+            if shape.Edges:
+                pts = []
+                for e in shape.Edges:
+                    int = geo_intersections.findIntersection(edge, e, True, True)
+                    if int:
+                        pts.extend(int)
+                if pts:
+                    point = pts[geo_general.findClosest(point, pts)]
+
+        # modifying active edge
+        if geo_general.geomType(edge) == "Line":
+            ang = None
+            ve = geo_general.vec(edge)
+            chord = v1.sub(point)
+            n = ve.cross(chord)
+            if n.Length == 0:
+                self.newpoint = point
+            else:
+                perp = ve.cross(n)
+                proj = DraftVecUtils.project(chord, perp)
+                self.newpoint = App.Vector.add(point, proj)
+            dist = v1.sub(self.newpoint).Length
+            ghost.p1(self.newpoint)
+            ghost.p2(v2)
+            if real:
+                if self.force:
+                    ray = self.newpoint.sub(v1)
+                    if ray.Length:
+                        ray.multiply(self.force / ray.Length)
+                    self.newpoint = App.Vector.add(v1, ray)
+                newedges.append(Part.LineSegment(self.newpoint, v2).toShape())
+        else:
+            dist = None
+            center = edge.Curve.Center
+            rad = edge.Curve.Radius
+            ang1 = DraftVecUtils.angle(v2.sub(center))
+            ang2 = DraftVecUtils.angle(point.sub(center))
+            _rot_rad = DraftVecUtils.rotate(App.Vector(rad, 0, 0), -ang2)
+            self.newpoint = App.Vector.add(center, _rot_rad)
+            ang = math.degrees(-ang2)
+            # if ang1 > ang2:
+            #     ang1, ang2 = ang2, ang1
+            # print("last calculated:",
+            #       math.degrees(-ang1),
+            #       math.degrees(-ang2))
+            ghost.setEndAngle(-ang2)
+            ghost.setStartAngle(-ang1)
+            ghost.setCenter(center)
+            ghost.setRadius(rad)
+            if real:
+                if self.force:
+                    angle = math.radians(self.force)
+                    newray = DraftVecUtils.rotate(App.Vector(rad, 0, 0), -angle)
+                    self.newpoint = App.Vector.add(center, newray)
+                chord = self.newpoint.sub(v2)
+                perp = chord.cross(App.Vector(0, 0, 1))
+                scaledperp = DraftVecUtils.scaleTo(perp, rad)
+                midpoint = App.Vector.add(center, scaledperp)
+                _sh = Part.Arc(self.newpoint, midpoint, v2).toShape()
+                newedges.append(_sh)
+        ghost.on()
+
+        # resetting the edges
+        if not reverse:
+            li = list(range(npoint + 1, len(self.edges)))
+        else:
+            li = list(range(npoint - 1, -1, -1))
+        for i in li:
+            edge = self.edges[i]
+            ghost = self.ghost[i]
+            if geo_general.geomType(edge) == "Line":
+                ghost.p1(edge.Vertexes[0].Point)
+                ghost.p2(edge.Vertexes[-1].Point)
+            else:
+                ang1 = DraftVecUtils.angle(edge.Vertexes[0].Point.sub(center))
+                ang2 = DraftVecUtils.angle(edge.Vertexes[-1].Point.sub(center))
+                # if ang1 > ang2:
+                #     ang1, ang2 = ang2, ang1
+                ghost.setEndAngle(-ang2)
+                ghost.setStartAngle(-ang1)
+                ghost.setCenter(edge.Curve.Center)
+                ghost.setRadius(edge.Curve.Radius)
+            if real:
+                newedges.append(edge)
+            ghost.on()
+
+        # finishing
+        if real:
+            return newedges
+        else:
+            return [dist, ang]
+
+    def trimObject(self):
+        """Trim the actual object."""
+        import Part
+
+        if self.extrudeMode:
+            delta = self.extrude(self.shift, real=True)
+            self.doc.openTransaction("Extrude")
+            Gui.addModule("Draft")
+            base = self.extrudeBase
+            if base is None:
+                base = self.doc.addObject("Part::Feature", "Face")
+                base.Shape = self.extrudeShape
+            obj = extrude.extrude(base, delta, solid=True)
+            self.doc.commitTransaction()
+            self.obj = obj
+        else:
+            edges = self.redraw(self.point, self.snapped, self.shift, self.alt, real=True)
+            newshape = Part.Wire(edges)
+            self.doc.openTransaction("Trim/extend")
+            if self.axisSetter is not None:
+                points = list(self.axisEndpoints)
+                points[self.lockedActivePoint] = self.newpoint
+                self.axisSetter(points)
+            elif utils.getType(self.obj) in ["Wire", "BSpline"]:
+                p = []
+                if self.placement:
+                    invpl = self.placement.inverse()
+                for v in newshape.Vertexes:
+                    np = v.Point
+                    if self.placement:
+                        np = invpl.multVec(np)
+                    p.append(np)
+                if self.reverse:
+                    # points come out backwards when the end was moved (#19189)
+                    p.reverse()
+                self.obj.Points = p
+            elif utils.getType(self.obj) == "Part::Line":
+                p = []
+                if self.placement:
+                    invpl = self.placement.inverse()
+                for v in newshape.Vertexes:
+                    np = v.Point
+                    if self.placement:
+                        np = invpl.multVec(np)
+                    p.append(np)
+                if (p[0].x == self.obj.X1) and (p[0].y == self.obj.Y1) and (p[0].z == self.obj.Z1):
+                    self.obj.X2 = p[-1].x
+                    self.obj.Y2 = p[-1].y
+                    self.obj.Z2 = p[-1].z
+                elif (
+                    (p[-1].x == self.obj.X1)
+                    and (p[-1].y == self.obj.Y1)
+                    and (p[-1].z == self.obj.Z1)
+                ):
+                    self.obj.X2 = p[0].x
+                    self.obj.Y2 = p[0].y
+                    self.obj.Z2 = p[0].z
+                elif (
+                    (p[0].x == self.obj.X2) and (p[0].y == self.obj.Y2) and (p[0].z == self.obj.Z2)
+                ):
+                    self.obj.X1 = p[-1].x
+                    self.obj.Y1 = p[-1].y
+                    self.obj.Z1 = p[-1].z
+                else:
+                    self.obj.X1 = p[0].x
+                    self.obj.Y1 = p[0].y
+                    self.obj.Z1 = p[0].z
+            elif utils.getType(self.obj) == "Circle":
+                angles = self.ghost[0].getAngles()
+                # print("original", self.obj.FirstAngle," ",self.obj.LastAngle)
+                # print("new", angles)
+                if angles[0] > angles[1]:
+                    angles = (angles[1], angles[0])
+                if self.placement:
+                    # the ghost angles are global, FirstAngle and LastAngle
+                    # are relative to the placement of the arc (#22913)
+                    rot = self.placement.Rotation.inverted()
+                    local = []
+                    for a in angles:
+                        a = math.radians(a)
+                        vec = rot.multVec(App.Vector(math.cos(a), math.sin(a), 0))
+                        local.append(math.degrees(math.atan2(vec.y, vec.x)))
+                    if rot.multVec(App.Vector(0, 0, 1)).z < 0:
+                        local.reverse()
+                    angles = local
+                self.obj.FirstAngle = angles[0]
+                self.obj.LastAngle = angles[1]
+            else:
+                self.obj.Shape = newshape
+            self.doc.recompute()
+            self.doc.commitTransaction()
+        self.doc.recompute()
+        for g in self.ghost:
+            g.off()
+
+    def trimObjects(self, objectslist):
+        """Attempt to trim two objects together."""
+        import Part
+
+        wires = []
+        for obj in objectslist:
+            if not utils.getType(obj) in ["Wire", "Circle"]:
+                _err(
+                    translate(
+                        "draft",
+                        "Unable to trim these objects, " "only Draft wires and arcs are supported",
+                    )
+                )
+                return
+            if len(obj.Shape.Wires) > 1:
+                _err(translate("draft", "Unable to trim these objects, " "too many wires"))
+                return
+            if len(obj.Shape.Wires) == 1:
+                wires.append(obj.Shape.Wires[0])
+            else:
+                wires.append(Part.Wire(obj.Shape.Edges))
+        ints = []
+        edge1 = None
+        edge2 = None
+        for i1, e1 in enumerate(wires[0].Edges):
+            for i2, e2 in enumerate(wires[1].Edges):
+                i = geo_intersections.findIntersection(e1, e2, dts=False)
+                if len(i) == 1:
+                    ints.append(i[0])
+                    edge1 = i1
+                    edge2 = i2
+        if not ints:
+            _err(translate("draft", "These objects do not intersect"))
+            return
+        if len(ints) != 1:
+            _err(translate("draft", "Too many intersection points"))
+            return
+
+        v11 = wires[0].Vertexes[0].Point
+        v12 = wires[0].Vertexes[-1].Point
+        v21 = wires[1].Vertexes[0].Point
+        v22 = wires[1].Vertexes[-1].Point
+        if DraftVecUtils.closest(ints[0], [v11, v12]) == 1:
+            last1 = True
+        else:
+            last1 = False
+        if DraftVecUtils.closest(ints[0], [v21, v22]) == 1:
+            last2 = True
+        else:
+            last2 = False
+        for i, obj in enumerate(objectslist):
+            if i == 0:
+                ed = edge1
+                la = last1
+            else:
+                ed = edge2
+                la = last2
+            if utils.getType(obj) == "Wire":
+                if la:
+                    pts = obj.Points[: ed + 1] + ints
+                else:
+                    pts = ints + obj.Points[ed + 1 :]
+                obj.Points = pts
+            else:
+                vec = ints[0].sub(obj.Placement.Base)
+                vec = obj.Placement.inverse().Rotation.multVec(vec)
+                _x = App.Vector(1, 0, 0)
+                _ang = -DraftVecUtils.angle(
+                    vec, obj.Placement.Rotation.multVec(_x), obj.Shape.Edges[0].Curve.Axis
+                )
+                ang = math.degrees(_ang)
+                if la:
+                    obj.LastAngle = ang
+                else:
+                    obj.FirstAngle = ang
+        self.doc.recompute()
+
+    def finish(self, cont=False):
+        """Terminate the operation of the Trimex tool."""
+        self.end_callbacks(self.call)
+        self.force = None
+        if self.ui:
+            if self.linetrack:
+                self.linetrack.finalize()
+            if self.ghost:
+                for g in self.ghost:
+                    g.finalize()
+            if self.obj:
+                if self.color:
+                    self.obj.ViewObject.LineColor = self.color
+                if self.width:
+                    self.obj.ViewObject.LineWidth = self.width
+                gui_utils.select(self.obj)
+        super().finish()
+
+    def numericRadius(self, dist):
+        """Validate the entry fields in the user interface.
+
+        This function is called by the toolbar or taskpanel interface
+        when valid x, y, and z have been entered in the input fields.
+        """
+        self.force = dist
+        if self.point is None:
+            # no mouse position yet, so no direction to apply the value to (#33411)
+            _wrn(
+                translate(
+                    "draft", "Trimex: move the mouse into the 3D view " "before typing a value"
+                )
+            )
+            return
+        self.trimObject()
+        self.finish()
+
+    def get_action_hints(self):
+        # In Trimex the configured "constrain" and "alt" modifier keys don't
+        # do the standard constrain/copy actions, so we describe the actual
+        # Trimex-specific behavior instead of using the shared helpers.
+        constrain_key = gui_tool_utils._HINT_MOD_KEYS[params.get_param("modconstrain")]
+        alt_key = gui_tool_utils._HINT_MOD_KEYS[params.get_param("modalt")]
+        hints = [Gui.InputHint(translate("draft", "%1 pick target"), Gui.UserInput.MouseLeft)]
+        if self.extrudeMode:
+            hints.append(Gui.InputHint(translate("draft", "Hold %1 free direction"), constrain_key))
+        else:
+            hints.append(
+                Gui.InputHint(translate("draft", "Hold %1 keep active endpoint"), constrain_key)
+            )
+            hints.append(
+                Gui.InputHint(translate("draft", "Hold %1 invert trim direction"), alt_key)
+            )
+        return hints + gui_tool_utils._get_hint_mod_snap()
+
+
+class ExtrudeFace(Trimex):
+    """Face extrusion command sharing Trimex's interaction tools."""
+
+    command_name = QT_TRANSLATE_NOOP("draft", "Extrude Face")
+    selection_message = QT_TRANSLATE_NOOP("draft", "Select a face to extrude")
+    multi_object_selection = False
+
+    def proceed(self):
+        """Start the face-extrude interaction from exactly one selection."""
+        if self.call:
+            self.view.removeEventCallback("SoEvent", self.call)
+        selected = Gui.Selection.getSelection()
+        if len(selected) != 1:
+            self.finish()
+            _err(translate("draft", "Select a single face to extrude"))
+            return
+        self._startFaceExtrude(Gui.Selection.getSelectionEx("", 0)[0])
+
+
+Gui.addCommand("Draft_Trimex", Trimex())
+
+## @}

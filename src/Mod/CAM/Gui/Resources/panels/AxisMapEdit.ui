@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>TaskPanel</class>
+ <widget class="QWidget" name="TaskPanel">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>376</width>
+    <height>387</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>AxisMap Dressup</string>
+  </property>
+  <layout class="QGridLayout" name="gridLayout">
+   <item row="0" column="0">
+    <widget class="QLabel" name="lblRadius">
+     <property name="text">
+      <string>Radius</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1">
+    <widget class="Gui::QuantitySpinBox" name="radius"/>
+   </item>
+   <item row="1" column="0">
+    <widget class="QLabel" name="lblAxisMap">
+     <property name="text">
+      <string>Axis mapping</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="1">
+    <widget class="QComboBox" name="axisMap"/>
+   </item>
+   <item row="2" column="0">
+    <widget class="QCheckBox" name="reverse">
+     <property name="text">
+      <string>Invert Direction</string>
+     </property>
+    </widget>
+   </item>
+   <item row="3" column="2">
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>275</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>Gui::QuantitySpinBox</class>
+   <extends>QWidget</extends>
+   <header>Gui/QuantitySpinBox.h</header>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>

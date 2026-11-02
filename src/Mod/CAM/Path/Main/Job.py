@@ -1,0 +1,1321 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+# ***************************************************************************
+# *   Copyright (c) 2014 Yorik van Havre <yorik@uncreated.net>              *
+# *                                                                         *
+# *   This program is free software; you can redistribute it and/or modify  *
+# *   it under the terms of the GNU Lesser General Public License (LGPL)    *
+# *   as published by the Free Software Foundation; either version 2 of     *
+# *   the License, or (at your option) any later version.                   *
+# *   for detail see the LICENCE text file.                                 *
+# *                                                                         *
+# *   This program is distributed in the hope that it will be useful,       *
+# *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+# *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+# *   GNU Library General Public License for more details.                  *
+# *                                                                         *
+# *   You should have received a copy of the GNU Library General Public     *
+# *   License along with this program; if not, write to the Free Software   *
+# *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  *
+# *   USA                                                                   *
+# *                                                                         *
+# ***************************************************************************
+
+from Path.Op.Util import getCycleTimeEstimate
+from Path.Post.Processor import PostProcessorFactory  # PostProcessor,
+from PySide import QtCore
+from PySide.QtCore import QT_TRANSLATE_NOOP
+import FreeCAD
+import Path
+import json
+import Path.Base.SetupSheet as PathSetupSheet
+import Path.Base.Util as PathUtil
+import Path.Main.Stock as PathStock
+import Path.Tool.Controller as PathToolController
+import json
+import time
+
+# lazily loaded modules
+from lazy_loader.lazy_loader import LazyLoader
+
+Draft = LazyLoader("Draft", globals(), "Draft")
+
+
+if False:
+    Path.Log.setLevel(Path.Log.Level.DEBUG, Path.Log.thisModule())
+    Path.Log.trackModule(Path.Log.thisModule())
+else:
+    Path.Log.setLevel(Path.Log.Level.INFO, Path.Log.thisModule())
+
+translate = FreeCAD.Qt.translate
+
+
+class JobTemplate:
+    """Attribute and sub element strings for template export/import."""
+
+    Description = "Desc"
+    GeometryTolerance = "Tolerance"
+    Job = "Job"
+    PostProcessor = "Post"
+    PostProcessorArgs = "PostArgs"
+    PostProcessorOutputFile = "Output"
+    Fixtures = "Fixtures"
+    OrderOutputBy = "OrderOutputBy"
+    SplitOutput = "SplitOutput"
+    SetupSheet = "SetupSheet"
+    Stock = "Stock"
+    # TCs are grouped under Tools in a job, the template refers to them directly though
+    ToolController = "ToolController"
+    PostProcessorPropertyOverrides = "PostPropertyOverrides"
+    Machine = "Machine"
+    Version = "Version"
+
+
+def isResourceClone(obj, propLink, resourceName):
+    if hasattr(propLink, "PathResource") and (
+        resourceName is None or resourceName == propLink.PathResource
+    ):
+        return True
+    return False
+
+
+def createResourceClone(obj, orig, name, icon):
+    clone = Draft.clone(orig)
+    clone.Label = "%s-%s" % (name, orig.Label)
+    clone.addProperty("App::PropertyString", "PathResource")
+    clone.PathResource = name
+    if clone.ViewObject:
+        import Path.Base.Gui.IconViewProvider
+
+        Path.Base.Gui.IconViewProvider.Attach(clone.ViewObject, icon)
+        clone.ViewObject.Visibility = False
+        clone.ViewObject.DisplayMode = "Flat Lines"
+        # clone.ViewObject.ShapeColor = (0.447, 0.475, 0.502)
+        clone.ViewObject.Transparency = 0
+        # clone.ViewObject.LineColor = (0.310, 0.333, 0.357)
+        # clone.ViewObject.ShapeMaterial.Shininess = 0.85
+    obj.Document.recompute()  # necessary to create the clone shape
+    return clone
+
+
+def createModelResourceClone(obj, orig):
+    return createResourceClone(obj, orig, "Model", "BaseGeometry")
+
+
+def linksTo(target, exclude=()):
+    """linksTo(target, exclude=()) ... what links target: for each link, the object and property
+    holding it, the kind of link, and the sub-elements named. Operations' base geometry, work
+    planes' attachments and the like; expressions are not followed."""
+    records = []
+    for obj in target.InList:
+        if obj in exclude:
+            continue
+        for prop in obj.PropertiesList:
+            kind = obj.getTypeIdOfProperty(prop)
+            if not kind.startswith("App::PropertyLink"):
+                continue
+            try:
+                value = obj.getPropertyByName(prop)
+            except Exception:
+                continue
+            record = {"obj": obj.Name, "prop": prop}
+            if kind.startswith("App::PropertyLinkSubList"):
+                for linked, subs in value or []:
+                    if linked == target:
+                        subs = [subs] if isinstance(subs, str) else list(subs)
+                        records.append(dict(record, kind="sublist", subs=subs))
+            elif kind.startswith("App::PropertyLinkSub"):
+                if value and value[0] == target:
+                    records.append(dict(record, kind="sub", subs=list(value[1])))
+            elif kind.startswith("App::PropertyLinkList"):
+                if target in (value or []):
+                    records.append(dict(record, kind="list"))
+            elif value == target:
+                records.append(dict(record, kind="link"))
+    return records
+
+
+def relink(doc, records, target):
+    """relink(doc, records, target) ... make the links records describe, as linksTo found them,
+    to target instead. Those whose object or property is gone are left out."""
+    for record in records:
+        obj = doc.getObject(record["obj"])
+        if obj is None or not hasattr(obj, record["prop"]):
+            continue
+        prop = record["prop"]
+        value = obj.getPropertyByName(prop)
+        kind = record["kind"]
+        if kind == "sublist":
+            entries = [(o, tuple(s) if not isinstance(s, str) else (s,)) for o, s in value or []]
+            entries.append((target, tuple(record["subs"])))
+            setattr(obj, prop, entries)
+        elif kind == "sub":
+            setattr(obj, prop, (target, record["subs"]))
+        elif kind == "list":
+            setattr(obj, prop, list(value or []) + [target])
+        else:
+            setattr(obj, prop, target)
+
+
+def touchOperations(job):
+    """touchOperations(job) ... every operation of the Job to be computed again: one made from
+    the stock rather than from the model's geometry, a facing say, is not linked to what moved."""
+    for op in job.Proxy.allOperations():
+        op.touch()
+
+
+def objectsInModelFrame(job):
+    """objectsInModelFrame(job) ... what is placed on the part without being attached to it, and
+    so does not follow the model by itself when it is moved: work planes set where they are, and
+    the text, sketches and other shapes operations are made from."""
+    carried = []
+
+    def carry(obj):
+        if obj is None or obj in carried or not hasattr(obj, "Placement"):
+            return
+        if obj in job.Model.Group or obj == job.Stock:
+            return
+        if getattr(obj, "AttachmentSupport", None) and getattr(obj, "MapMode", "") != "Deactivated":
+            return
+        carried.append(obj)
+
+    for workplane in getattr(getattr(job, "Workplanes", None), "Group", []) or []:
+        carry(workplane)
+    import PathScripts.PathUtils as PathUtils
+
+    for obj in job.Document.Objects:
+        if not hasattr(obj, "Proxy") or not hasattr(obj, "Path"):
+            continue
+        if PathUtils.findParentJob(obj) != job:
+            continue
+        for shape in getattr(obj, "BaseShapes", []) or []:
+            carry(shape)
+    return carried
+
+
+def jobOfModel(obj):
+    """jobOfModel(obj) ... the Job whose model obj is, None if it is none's."""
+    for o in obj.InList:
+        for job in o.InList:
+            if getattr(job, "Model", None) == o and hasattr(job, "Operations"):
+                return job
+    return None
+
+
+def keepToScaledModel(job, model, before, after):
+    """keepToScaledModel(job, model, before, after) ... what is made from the Job's model kept
+    where it was on the part as the model's Scale changes from before to after, each its own size:
+    what is attached to the model its offset scaled, along the model's own axes; what is set on
+    the part unattached its place."""
+    ratio = []
+    for b, a in zip(before, after):
+        if abs(b) < 1e-12:
+            return
+        ratio.append(a / b)
+    if all(abs(r - 1) < 1e-12 for r in ratio):
+        return
+
+    def scaled(v):
+        return FreeCAD.Vector(v.x * ratio[0], v.y * ratio[1], v.z * ratio[2])
+
+    turn = model.Placement.Rotation
+    for obj in model.InList:
+        support = getattr(obj, "AttachmentSupport", None) or []
+        if getattr(obj, "MapMode", "Deactivated") == "Deactivated":
+            continue
+        if not any(entry[0] == model for entry in support):
+            continue
+        # the offset along the axes of the frame it is attached to, scaled along the model's
+        offset = FreeCAD.Placement(obj.AttachmentOffset)
+        frame = obj.Placement.multiply(offset.inverse()).Rotation
+        toModel = turn.inverted().multiply(frame)
+        offset.Base = toModel.inverted().multVec(scaled(toModel.multVec(offset.Base)))
+        obj.AttachmentOffset = offset
+    inverse = model.Placement.inverse()
+    for obj in objectsInModelFrame(job):
+        placement = FreeCAD.Placement(obj.Placement)
+        placement.Base = model.Placement.multVec(scaled(inverse.multVec(placement.Base)))
+        obj.Placement = placement
+
+
+class _ModelScale:
+    """A Job's model scaled, what is made from it kept to it: the Scale a Job's clone of its model
+    has, as it was before it changed."""
+
+    def __init__(self):
+        self.before = {}
+
+    def slotBeforeChangeObject(self, obj, prop):
+        # a Job's clone of its model only, as createResourceClone marks it
+        if prop == "Scale" and getattr(obj, "PathResource", None) == "Model":
+            self.before[(obj.Document.Name, obj.Name)] = FreeCAD.Vector(obj.Scale)
+
+    def slotChangedObject(self, obj, prop):
+        if prop != "Scale":
+            return
+        before = self.before.pop((obj.Document.Name, obj.Name), None)
+        doc = obj.Document
+        if before is None or doc.Restoring or doc.Transacting:
+            return
+        job = jobOfModel(obj)
+        if job is not None:
+            keepToScaledModel(job, obj, before, obj.Scale)
+
+
+_modelScale = None
+
+
+def _watchModelScale():
+    global _modelScale
+    if _modelScale is None:
+        _modelScale = _ModelScale()
+        FreeCAD.addDocumentObserver(_modelScale)
+
+
+_watchModelScale()
+
+
+class NotificationClass(QtCore.QObject):
+    updateTC = QtCore.Signal(object, object)
+
+
+Notification = NotificationClass()
+
+
+class ObjectJob:
+    def __init__(self, obj, models, templateFile=None):
+        self.obj = obj
+        self.tooltip = None
+        self.tooltipArgs = None
+        obj.Proxy = self
+
+        obj.addProperty(
+            "App::PropertyFile",
+            "PostProcessorOutputFile",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "The G-code output file for this project"),
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "PostProcessor",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "Select the Post Processor"),
+        )
+        obj.addProperty(
+            "App::PropertyString",
+            "PostProcessorArgs",
+            "Output",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Arguments for the Post Processor (specific to the script)",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyString",
+            "LastPostProcessDate",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "Last Time the Job was post processed"),
+        )
+        obj.setEditorMode("LastPostProcessDate", 2)  # Hide
+        obj.addProperty(
+            "App::PropertyString",
+            "LastPostProcessOutput",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "Last Time the Job was post processed"),
+        )
+        obj.setEditorMode("LastPostProcessOutput", 2)  # Hide
+
+        obj.addProperty(
+            "App::PropertyString",
+            "Description",
+            "Path",
+            QT_TRANSLATE_NOOP("App::Property", "An optional description for this job"),
+        )
+        obj.addProperty(
+            "App::PropertyString",
+            "CycleTime",
+            "Path",
+            QT_TRANSLATE_NOOP("App::Property", "Job Cycle Time Estimation"),
+        )
+        obj.setEditorMode("CycleTime", 1)  # read-only
+        obj.addProperty(
+            "App::PropertyLength",
+            "GeometryTolerance",
+            "Geometry",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "For computing Paths; smaller increases accuracy, but slows down computation",
+            ),
+        )
+
+        obj.addProperty(
+            "App::PropertyLink",
+            "Stock",
+            "Base",
+            QT_TRANSLATE_NOOP("App::Property", "Solid object to be used as stock."),
+        )
+        obj.addProperty(
+            "App::PropertyLink",
+            "Operations",
+            "Base",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Compound path of all operations in the order they are processed.",
+            ),
+        )
+
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "JobType",
+            "Base",
+            QT_TRANSLATE_NOOP("App::Property", "Select the Type of Job"),
+        )
+        obj.setEditorMode("JobType", 2)  # Hide
+
+        obj.addProperty(
+            "App::PropertyBool",
+            "SplitOutput",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "Split output into multiple G-code files"),
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "OrderOutputBy",
+            "WCS",
+            QT_TRANSLATE_NOOP("App::Property", "If multiple WCS, order the output this way"),
+        )
+        obj.addProperty(
+            "App::PropertyStringList",
+            "Fixtures",
+            "WCS",
+            QT_TRANSLATE_NOOP("App::Property", "The Work Coordinate Systems for the Job"),
+        )
+        obj.addProperty(
+            "App::PropertyString",
+            "Machine",
+            "Output",
+            QT_TRANSLATE_NOOP("App::Property", "The Machine for the Job"),
+        )
+        obj.addProperty(
+            "App::PropertyString",
+            "PostProcessorPropertyOverrides",
+            "Output",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "JSON dict of postprocessor properties that override machine defaults for this job",
+            ),
+        )
+        obj.PostProcessorPropertyOverrides = "{}"
+
+        obj.Fixtures = ["G54"]
+
+        for n in self.propertyEnumerations():
+            setattr(obj, n[0], n[1])
+
+        obj.PostProcessorOutputFile = Path.Preferences.defaultOutputFile()
+        postProcessors = Path.Preferences.allEnabledLegacyPostProcessors()
+        # Add empty string as a valid enumeration option
+        if "" not in postProcessors:
+            postProcessors = [""] + postProcessors
+        obj.PostProcessor = postProcessors
+        defaultPostProcessor = Path.Preferences.defaultPostProcessor()
+        # Check to see if default post processor hasn't been 'lost' (This can happen when Macro dir has changed)
+        if defaultPostProcessor in postProcessors:
+            obj.PostProcessor = defaultPostProcessor
+        else:
+            obj.PostProcessor = ""
+        obj.PostProcessorArgs = Path.Preferences.defaultPostProcessorArgs()
+
+        obj.GeometryTolerance = Path.Preferences.defaultGeometryTolerance()
+
+        self.setupOperations(obj)
+        self.setupWorkplanes(obj)
+        self.setupSetupSheet(obj)
+        self.setupBaseModel(obj, models)
+        self.setupToolTable(obj)
+        self.setFromTemplateFile(obj, templateFile)
+        self.setupStock(obj)
+
+    @classmethod
+    def propertyEnumerations(self, dataType="data"):
+        """propertyEnumerations(dataType="data")... return property enumeration lists of specified dataType.
+        Args:
+            dataType = 'data', 'raw', 'translated'
+        Notes:
+        'data' is list of internal string literals used in code
+        'raw' is list of (translated_text, data_string) tuples
+        'translated' is list of translated string literals
+        """
+
+        enums = {
+            "OrderOutputBy": [
+                (translate("CAM_Job", "Fixture"), "Fixture"),
+                (translate("CAM_Job", "Tool"), "Tool"),
+                (translate("CAM_Job", "Operation"), "Operation"),
+            ],
+            "JobType": [
+                (translate("CAM_Job", "2D"), "2D"),
+                (translate("CAM_Job", "2.5D"), "2.5D"),
+                (translate("CAM_Job", "Lathe"), "Lathe"),
+                (translate("CAM_Job", "Multiaxis"), "Multiaxis"),
+            ],
+        }
+
+        if dataType == "raw":
+            return enums
+
+        data = list()
+        idx = 0 if dataType == "translated" else 1
+
+        Path.Log.debug(enums)
+
+        for k, v in enumerate(enums):
+            data.append((v, [tup[idx] for tup in enums[v]]))
+        Path.Log.debug(data)
+
+        return data
+
+    def setupOperations(self, obj):
+        """setupOperations(obj)... setup the Operations group for the Job object."""
+        # ops = FreeCAD.ActiveDocument.addObject(
+        #     "Path::FeatureCompoundPython", "Operations"
+        # )
+        ops = FreeCAD.ActiveDocument.addObject("App::DocumentObjectGroup", "Operations")
+        if ops.ViewObject:
+            # ops.ViewObject.Proxy = 0
+            ops.ViewObject.Visibility = True
+
+        obj.Operations = ops
+        obj.setEditorMode("Operations", 2)  # hide
+        obj.setEditorMode("Placement", 2)
+
+    def setupWorkplanes(self, obj):
+        """setupWorkplanes(obj) ... set up the Workplanes group for the Job.
+
+        Holds the named frames operations can share. A workplane is a plain
+        Part::LocalCoordinateSystem: it already carries an attachment to the
+        geometry it was derived from, the map modes that describe a plane from
+        a face or three points, an editable offset, and a placement that
+        recomputes when the model moves. None of that needs reimplementing
+        here."""
+        if not hasattr(obj, "Workplanes"):
+            obj.addProperty(
+                "App::PropertyLink",
+                "Workplanes",
+                "Base",
+                QT_TRANSLATE_NOOP(
+                    "App::Property", "Group of named work planes the Operations can share"
+                ),
+            )
+        if getattr(obj, "Workplanes", None):
+            return
+
+        group = obj.Document.addObject("App::DocumentObjectGroup", "Workplanes")
+        group.Label = "Workplanes"
+        obj.Workplanes = group
+        obj.setEditorMode("Workplanes", 2)  # hide
+
+    def adoptOrphanWorkplanes(self, obj):
+        """adoptOrphanWorkplanes(obj) ... file any work plane an operation links
+        to but the group does not hold.
+
+        An operation migrating from an older document may create its work
+        plane before the Job is far enough restored to have a group. Restore
+        order across objects is not guaranteed, so the Job picks them up."""
+        if not getattr(obj, "Workplanes", None) or not getattr(obj, "Operations", None):
+            return
+        held = set(o.Name for o in obj.Workplanes.Group)
+        for op in obj.Operations.Group:
+            workplane = getattr(op, "Workplane", None)
+            if workplane is not None and hasattr(workplane, "Placement"):
+                if workplane.Name not in held:
+                    obj.Workplanes.addObject(workplane)
+                    held.add(workplane.Name)
+
+    def setupSetupSheet(self, obj):
+        if not getattr(obj, "SetupSheet", None):
+            if not hasattr(obj, "SetupSheet"):
+                obj.addProperty(
+                    "App::PropertyLink",
+                    "SetupSheet",
+                    "Base",
+                    QT_TRANSLATE_NOOP(
+                        "App::Property", "SetupSheet holding the settings for this job"
+                    ),
+                )
+            obj.SetupSheet = PathSetupSheet.Create()
+            if obj.SetupSheet.ViewObject:
+                import Path.Base.Gui.IconViewProvider
+
+                Path.Base.Gui.IconViewProvider.Attach(obj.SetupSheet.ViewObject, "SetupSheet")
+            obj.SetupSheet.Label = "SetupSheet"
+        self.setupSheet = obj.SetupSheet.Proxy
+
+    def setupBaseModel(self, obj, models=None):
+        Path.Log.track(obj.Label, models)
+        addModels = False
+
+        if not hasattr(obj, "Model"):
+            obj.addProperty(
+                "App::PropertyLink",
+                "Model",
+                "Base",
+                QT_TRANSLATE_NOOP("App::Property", "The base objects for all operations"),
+            )
+            addModels = True
+        elif obj.Model is None:
+            addModels = True
+
+        if addModels:
+            model = FreeCAD.ActiveDocument.addObject("App::DocumentObjectGroup", "Model")
+            if model.ViewObject:
+                model.ViewObject.Visibility = False
+            if models:
+                model.addObjects([createModelResourceClone(obj, base) for base in models])
+            obj.Model = model
+            obj.Model.Label = "Model"
+
+        if hasattr(obj, "Base"):
+            Path.Log.info("Converting Job.Base to new Job.Model for {}".format(obj.Label))
+            obj.Model.addObject(obj.Base)
+            obj.Base = None
+            obj.removeProperty("Base")
+
+    def setupToolTable(self, obj):
+        addTable = False
+        if not hasattr(obj, "Tools"):
+            obj.addProperty(
+                "App::PropertyLink",
+                "Tools",
+                "Base",
+                QT_TRANSLATE_NOOP(
+                    "App::Property", "Collection of all tool controllers for the job"
+                ),
+            )
+            addTable = True
+        elif obj.Tools is None:
+            addTable = True
+
+        if addTable:
+            toolTable = FreeCAD.ActiveDocument.addObject("App::DocumentObjectGroup", "Tools")
+            toolTable.Label = "Tools"
+            if toolTable.ViewObject:
+                toolTable.ViewObject.Visibility = False
+            if hasattr(obj, "ToolController"):
+                toolTable.addObjects(obj.ToolController)
+                obj.removeProperty("ToolController")
+            obj.Tools = toolTable
+
+    def setupStock(self, obj):
+        """setupStock(obj)... setup the Stock for the Job object."""
+        if not obj.Stock:
+            stockTemplate = Path.Preferences.defaultStockTemplate()
+            if stockTemplate:
+                obj.Stock = PathStock.CreateFromTemplate(obj, json.loads(stockTemplate))
+            if not obj.Stock:
+                obj.Stock = PathStock.CreateFromBase(obj)
+        # I think this is redundant code, and is handled in SetupStockObject,
+        # but leaving here for now just in case
+        # PathStock.ApplyStockViewDefaults(obj.Stock)
+        # if obj.Stock and obj.Stock.ViewObject:
+        #     obj.Stock.ViewObject.Visibility = True
+
+    def modelLinks(self, obj, base):
+        """modelLinks(obj, base) ... what links the clone base of a model: the operations' base
+        geometry, the work planes' attachments and the like, the Job's own links left out."""
+        return linksTo(base, (obj, obj.Model, obj.Stock))
+
+    def removeBase(self, obj, base, removeFromModel):
+        if isResourceClone(obj, base, None):
+            # What links the clone goes with it. It is remembered, for the model's clone, should
+            # the model be added to the Job again, to take up.
+            records = self.modelLinks(obj, base)
+            model = self.baseObject(obj, base)
+            if records and model is not None:
+                self.setupDetachedModelLinks(obj)
+                links = dict(obj.DetachedModelLinks)
+                links[model.Name] = json.dumps(records)
+                obj.DetachedModelLinks = links
+            PathUtil.clearExpressionEngine(base)
+            if removeFromModel:
+                obj.Model.removeObject(base)
+            obj.Document.removeObject(base.Name)
+
+    def setupDetachedModelLinks(self, obj):
+        if not hasattr(obj, "DetachedModelLinks"):
+            obj.addProperty(
+                "App::PropertyMap",
+                "DetachedModelLinks",
+                "Base",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "The links to models taken out of the Job, for when they are added back",
+                ),
+            )
+            obj.setEditorMode("DetachedModelLinks", 2)  # hide
+
+    def addModel(self, obj, model):
+        """addModel(obj, model) ... add model to the Job, as a clone, and return the clone. A
+        model taken out before has what linked its clone then linked to the new one."""
+        base = createModelResourceClone(obj, model)
+        obj.Model.addObject(base)
+        links = dict(getattr(obj, "DetachedModelLinks", {}) or {})
+        if model.Name in links:
+            relink(obj.Document, json.loads(links.pop(model.Name)), base)
+            obj.DetachedModelLinks = links
+            obj.Document.recompute()
+        return base
+
+    def modelBoundBox(self, obj):
+        return PathStock.shapeBoundBox(obj.Model.Group)
+
+    def onDelete(self, obj, arg2=None):
+        """Called by the view provider, there doesn't seem to be a callback on the obj itself."""
+        Path.Log.track(obj.Label, arg2)
+        doc = obj.Document
+
+        if getattr(obj, "Operations", None):
+            # the first to tear down are the ops, they depend on other resources
+            Path.Log.debug("taking down ops: %s" % [o.Name for o in self.allOperations()])
+            while obj.Operations.Group:
+                op = obj.Operations.Group[0]
+                if (
+                    not op.ViewObject
+                    or not hasattr(op.ViewObject.Proxy, "onDelete")
+                    or op.ViewObject.Proxy.onDelete(op.ViewObject, ())
+                ):
+                    PathUtil.clearExpressionEngine(op)
+                    doc.removeObject(op.Name)
+            obj.Operations.Group = []
+            doc.removeObject(obj.Operations.Name)
+            obj.Operations = None
+
+        # stock could depend on Model, so delete it first
+        if getattr(obj, "Stock", None):
+            Path.Log.debug("taking down stock")
+            PathUtil.clearExpressionEngine(obj.Stock)
+            doc.removeObject(obj.Stock.Name)
+            obj.Stock = None
+
+        # base doesn't depend on anything inside job
+        if getattr(obj, "Model", None):
+            for base in obj.Model.Group:
+                Path.Log.debug("taking down base %s" % base.Label)
+                self.removeBase(obj, base, False)
+            obj.Model.Group = []
+            doc.removeObject(obj.Model.Name)
+            obj.Model = None
+
+        # Tool controllers might refer to either legacy tool or toolbit
+        if getattr(obj, "Tools", None):
+            Path.Log.debug("taking down tool controller")
+            for tc in obj.Tools.Group:
+                if hasattr(tc.Tool, "BitBody") and tc.Tool.BitBody:
+                    tc.Tool.BitBody.removeObjectsFromDocument()
+                    doc.removeObject(tc.Tool.BitBody.Name)
+                if hasattr(tc.Tool, "Proxy"):
+                    PathUtil.clearExpressionEngine(tc.Tool)
+                    doc.removeObject(tc.Tool.Name)
+                PathUtil.clearExpressionEngine(tc)
+                tc.Proxy.onDelete(tc)
+                doc.removeObject(tc.Name)
+            obj.Tools.Group = []
+            doc.removeObject(obj.Tools.Name)
+            obj.Tools = None
+
+        # SetupSheet
+        if getattr(obj, "SetupSheet", None):
+            PathUtil.clearExpressionEngine(obj.SetupSheet)
+            doc.removeObject(obj.SetupSheet.Name)
+            obj.SetupSheet = None
+
+        if getattr(obj, "Workplanes", None):
+            Path.Log.debug("taking down workplanes")
+            for workplane in list(obj.Workplanes.Group):
+                PathUtil.clearExpressionEngine(workplane)
+                doc.removeObject(workplane.Name)
+            obj.Workplanes.Group = []
+            doc.removeObject(obj.Workplanes.Name)
+            obj.Workplanes = None
+
+        return True
+
+    def fixupOperations(self, obj):
+        if getattr(obj.Operations, "ViewObject", None):
+            try:
+                obj.Operations.ViewObject.DisplayMode
+            except Exception:
+                name = obj.Operations.Name
+                label = obj.Operations.Label
+                ops = FreeCAD.ActiveDocument.addObject("Path::FeatureCompoundPython", "Operations")
+                ops.ViewObject.Proxy = 0
+                ops.Group = obj.Operations.Group
+                obj.Operations.Group = []
+                obj.Operations = ops
+                FreeCAD.ActiveDocument.removeObject(name)
+                if label == "Unnamed":
+                    ops.Label = "Operations"
+                else:
+                    ops.Label = label
+
+    def ensureMachineProperty(self, obj):
+        """Ensure the Machine property exists as a String.
+        Migrates from Enumeration to String if needed (legacy documents)."""
+        if not hasattr(obj, "Machine"):
+            obj.addProperty(
+                "App::PropertyString",
+                "Machine",
+                "Output",
+                QT_TRANSLATE_NOOP("App::Property", "The Machine for the Job"),
+            )
+        elif obj.getTypeIdOfProperty("Machine") == "App::PropertyEnumeration":
+            current_value = getattr(obj, "Machine", "") or ""
+            obj.removeProperty("Machine")
+            obj.addProperty(
+                "App::PropertyString",
+                "Machine",
+                "Output",
+                QT_TRANSLATE_NOOP("App::Property", "The Machine for the Job"),
+            )
+            obj.Machine = current_value
+
+    def onDocumentRestored(self, obj):
+        self.setupBaseModel(obj)
+        self.fixupOperations(obj)
+        self.setupSetupSheet(obj)
+
+        # Update PostProcessor enumeration to legacy-only posts
+        postProcessors = Path.Preferences.allEnabledLegacyPostProcessors()
+        if "" not in postProcessors:
+            postProcessors = [""] + postProcessors
+        obj.PostProcessor = postProcessors
+
+        # Ensure Machine property exists as a String.
+        # Old documents may have it as an Enumeration or not at all.
+        self.ensureMachineProperty(obj)
+
+        self.setupToolTable(obj)
+        self.integrityCheck(obj)
+
+        obj.setEditorMode("Operations", 2)  # hide
+        obj.setEditorMode("Placement", 2)
+
+        if hasattr(obj, "Path"):
+            obj.Path = Path.Path()
+
+        if not hasattr(obj, "CycleTime"):
+            obj.addProperty(
+                "App::PropertyString",
+                "CycleTime",
+                "Path",
+                QT_TRANSLATE_NOOP("App::Property", "Operations Cycle Time Estimation"),
+            )
+            obj.setEditorMode("CycleTime", 1)  # read-only
+
+        self.setupWorkplanes(obj)
+        self.adoptOrphanWorkplanes(obj)
+        import Path.Main.Workplane as PathWorkplane
+
+        for workplane in PathWorkplane.workplanesOf(obj):
+            PathWorkplane.ensureFixtureProperty(workplane)
+        if FreeCAD.GuiUp:
+            for workplane in PathWorkplane.workplanesOf(obj):
+                PathWorkplane.configureView(workplane)
+
+        if not hasattr(obj, "Fixtures"):
+            obj.addProperty(
+                "App::PropertyStringList",
+                "Fixtures",
+                "WCS",
+                QT_TRANSLATE_NOOP("App::Property", "The Work Coordinate Systems for the Job"),
+            )
+            obj.Fixtures = ["G54"]
+
+        if not hasattr(obj, "OrderOutputBy"):
+            obj.addProperty(
+                "App::PropertyEnumeration",
+                "OrderOutputBy",
+                "WCS",
+                QT_TRANSLATE_NOOP("App::Property", "If multiple WCS, order the output this way"),
+            )
+            obj.OrderOutputBy = ["Fixture", "Tool", "Operation"]
+
+        if not hasattr(obj, "SplitOutput"):
+            obj.addProperty(
+                "App::PropertyBool",
+                "SplitOutput",
+                "Output",
+                QT_TRANSLATE_NOOP("App::Property", "Split output into multiple G-code files"),
+            )
+            obj.SplitOutput = False
+
+        if not hasattr(obj, "JobType"):
+            obj.addProperty(
+                "App::PropertyEnumeration",
+                "JobType",
+                "Base",
+                QT_TRANSLATE_NOOP("App::Property", "Select the type of Job"),
+            )
+            obj.setEditorMode("JobType", 2)  # Hide
+
+        if not hasattr(obj, "Machine"):
+            obj.addProperty(
+                "App::PropertyString",
+                "Machine",
+                "Output",
+                QT_TRANSLATE_NOOP("App::Property", "The Machine for the Job"),
+            )
+        if not hasattr(obj, "PostProcessorPropertyOverrides"):
+            obj.addProperty(
+                "App::PropertyString",
+                "PostProcessorPropertyOverrides",
+                "Output",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "JSON dict of postprocessor properties that override machine defaults for this job",
+                ),
+            )
+            obj.PostProcessorPropertyOverrides = "{}"
+
+        for n in self.propertyEnumerations():
+            setattr(obj, n[0], n[1])
+
+        # Re-apply view defaults for older documents that may be missing them.
+        # These are safe to always apply since they restore intended CAM visual behaviour
+        # (stock non-selectable/transparent/dotted, model clones hidden with correct style).
+        if FreeCAD.GuiUp:
+            if getattr(obj, "Stock", None) and obj.Stock.ViewObject:
+                PathStock.ApplyStockViewDefaults(obj.Stock)
+
+            if getattr(obj, "Model", None) and getattr(obj.Model, "Group", None):
+                for base in obj.Model.Group:
+                    if isResourceClone(obj, base, "Model") and base.ViewObject:
+                        # base.ViewObject.Visibility = False
+                        base.ViewObject.DisplayMode = "Flat Lines"
+                        # base.ViewObject.ShapeColor = (0.447, 0.475, 0.502)
+                        base.ViewObject.Transparency = 0
+                        # base.ViewObject.LineColor = (0.310, 0.333, 0.357)
+                        # base.ViewObject.ShapeMaterial.Shininess = 0.85
+
+    def onChanged(self, obj, prop):
+        if prop == "PostProcessor" and obj.PostProcessor:
+            processor = PostProcessorFactory.get_post_processor(obj, obj.PostProcessor)
+            self.tooltip = processor.tooltip
+            self.tooltipArgs = processor.tooltipArgs
+
+    def baseObject(self, obj, base):
+        """Return the base object, not its clone."""
+        if isResourceClone(obj, base, "Model") or isResourceClone(obj, base, "Base"):
+            if hasattr(base, "Objects") and base.Objects:
+                return base.Objects[0]
+        return base
+
+    def baseObjects(self, obj):
+        """Return the base objects, not their clones."""
+        return [self.baseObject(obj, base) for base in obj.Model.Group]
+
+    def resourceClone(self, obj, base):
+        """resourceClone(obj, base) ... Return the resource clone for base if it exists."""
+        if isResourceClone(obj, base, None):
+            return base
+        for b in obj.Model.Group:
+            if base == b.Objects[0]:
+                return b
+        return None
+
+    def setFromTemplateFile(self, obj, template):
+        """setFromTemplateFile(obj, template) ... extract the properties from the given template file and assign to receiver.
+        This will also create any TCs stored in the template."""
+        tcs = []
+        if template:
+            with open(str(template), "rb") as fp:
+                attrs = json.load(fp)
+
+            if attrs.get(JobTemplate.Version) and 1 == int(attrs[JobTemplate.Version]):
+                attrs = self.setupSheet.decodeTemplateAttributes(attrs)
+                if attrs.get(JobTemplate.SetupSheet):
+                    self.setupSheet.setFromTemplate(attrs[JobTemplate.SetupSheet])
+
+                if attrs.get(JobTemplate.GeometryTolerance):
+                    obj.GeometryTolerance = float(attrs.get(JobTemplate.GeometryTolerance))
+                if attrs.get(JobTemplate.PostProcessor):
+                    templatePost = attrs.get(JobTemplate.PostProcessor)
+                    # Validate that the template's postprocessor exists in current enumeration
+                    if templatePost in obj.PostProcessor:
+                        obj.PostProcessor = templatePost
+                    else:
+                        Path.Log.warning(
+                            f"PostProcessor '{templatePost}' from template not found in available postprocessors. Using default."
+                        )
+                        Path.Log.debug(f"Available postprocessors: {obj.PostProcessor}")
+                        # Keep the default postprocessor that was already set
+                    if attrs.get(JobTemplate.PostProcessorArgs):
+                        obj.PostProcessorArgs = attrs.get(JobTemplate.PostProcessorArgs)
+                    else:
+                        obj.PostProcessorArgs = ""
+                if attrs.get(JobTemplate.PostProcessorPropertyOverrides):
+                    obj.PostProcessorPropertyOverrides = json.dumps(
+                        attrs[JobTemplate.PostProcessorPropertyOverrides]
+                    )
+                if attrs.get(JobTemplate.PostProcessorOutputFile):
+                    obj.PostProcessorOutputFile = attrs.get(JobTemplate.PostProcessorOutputFile)
+                if attrs.get(JobTemplate.Machine):
+                    obj.Machine = attrs.get(JobTemplate.Machine)
+                if attrs.get(JobTemplate.Description):
+                    obj.Description = attrs.get(JobTemplate.Description)
+
+                if attrs.get(JobTemplate.ToolController):
+                    for tc in attrs.get(JobTemplate.ToolController):
+                        ctrl = PathToolController.FromTemplate(tc)
+                        if ctrl:
+                            tcs.append(ctrl)
+                        else:
+                            Path.Log.debug(f"skipping TC {tc['name']}")
+                if attrs.get(JobTemplate.Stock):
+                    obj.Stock = PathStock.CreateFromTemplate(obj, attrs.get(JobTemplate.Stock))
+
+                if attrs.get(JobTemplate.Fixtures):
+                    obj.Fixtures = [x for y in attrs.get(JobTemplate.Fixtures) for x in y]
+
+                if attrs.get(JobTemplate.OrderOutputBy):
+                    obj.OrderOutputBy = attrs.get(JobTemplate.OrderOutputBy)
+
+                if attrs.get(JobTemplate.SplitOutput):
+                    obj.SplitOutput = attrs.get(JobTemplate.SplitOutput)
+
+                Path.Log.debug("setting tool controllers (%d)" % len(tcs))
+                if tcs:
+                    obj.Tools.Group = tcs
+            else:
+                Path.Log.error(
+                    "Unsupported PathJob template version {}".format(attrs.get(JobTemplate.Version))
+                )
+
+        if not tcs:
+            self.addToolController(PathToolController.Create())
+
+    def templateAttrs(self, obj):
+        """templateAttrs(obj) ... answer a dictionary with all properties of the receiver that should be stored in a template file."""
+        attrs = {}
+        attrs[JobTemplate.Version] = 1
+        if obj.PostProcessor:
+            attrs[JobTemplate.PostProcessor] = obj.PostProcessor
+            attrs[JobTemplate.PostProcessorArgs] = obj.PostProcessorArgs
+            attrs[JobTemplate.Fixtures] = [{f: True} for f in obj.Fixtures]
+            attrs[JobTemplate.OrderOutputBy] = obj.OrderOutputBy
+            attrs[JobTemplate.SplitOutput] = obj.SplitOutput
+        if (
+            hasattr(obj, "PostProcessorPropertyOverrides")
+            and obj.PostProcessorPropertyOverrides
+            and obj.PostProcessorPropertyOverrides != "{}"
+        ):
+            attrs[JobTemplate.PostProcessorPropertyOverrides] = json.loads(
+                obj.PostProcessorPropertyOverrides
+            )
+        if obj.PostProcessorOutputFile:
+            attrs[JobTemplate.PostProcessorOutputFile] = obj.PostProcessorOutputFile
+        if hasattr(obj, "Machine") and obj.Machine:
+            attrs[JobTemplate.Machine] = obj.Machine
+        attrs[JobTemplate.GeometryTolerance] = str(obj.GeometryTolerance.Value)
+        if obj.Description:
+            attrs[JobTemplate.Description] = obj.Description
+        return attrs
+
+    def dumps(self):
+        return None
+
+    def loads(self, state):
+        for obj in FreeCAD.ActiveDocument.Objects:
+            if hasattr(obj, "Proxy") and obj.Proxy == self:
+                self.obj = obj
+                break
+        return None
+
+    def execute(self, obj):
+        if not obj.GeometryTolerance:
+            obj.GeometryTolerance = Path.Preferences.defaultGeometryTolerance()
+
+        if getattr(obj, "Operations", None):
+            # obj.Path = obj.Operations.Path
+            self.getCycleTime()
+            if hasattr(obj, "PathChanged"):
+                obj.PathChanged = True
+
+    def getCycleTime(self):
+        seconds = 0
+        errorStr = ""
+        for op in self.obj.Operations.Group:
+            result = getCycleTimeEstimate(op, formatted=False)
+            if isinstance(result, (int, float)):
+                seconds += result
+            else:
+                errorStr = f" ({op.Label}: {result})"
+        timeStr = time.strftime("%H:%M:%S", time.gmtime(seconds))
+        self.obj.CycleTime = f"{timeStr}{errorStr}"
+
+    def addOperation(self, op, before=None, removeBefore=False):
+        group = self.obj.Operations.Group
+        if op not in group:
+            if before:
+                try:
+                    group.insert(group.index(before), op)
+                    if removeBefore:
+                        group.remove(before)
+                except Exception as e:
+                    Path.Log.error(e)
+                    group.append(op)
+            else:
+                group.append(op)
+            self.obj.Operations.Group = group
+            # op.Path.Center = self.obj.Operations.Path.Center
+
+    def getMachine(self):
+        """getMachine() ... returns an instantiated Machine object for this job.
+        Returns None if no machine is configured or if the machine cannot be loaded.
+        """
+        # TODO: Once Machine property is added to Job, use it here
+        # For now, return None since Machine property doesn't exist yet
+        if not hasattr(self.obj, "Machine"):
+            return None
+
+        machine_name = self.obj.Machine
+        if not machine_name:
+            return None
+
+        try:
+            from Machine.models.machine import MachineFactory
+
+            return MachineFactory.get_machine(machine_name)
+        except Exception as e:
+            Path.Log.error(f"Failed to load machine '{machine_name}': {e}")
+            return None
+
+    def nextToolNumber(self):
+        # returns the next available toolnumber in the job
+        group = self.obj.Tools.Group
+        if len(group) > 0:
+            return sorted([t.ToolNumber for t in group])[-1] + 1
+        else:
+            return 1
+
+    def addToolController(self, tc):
+        group = self.obj.Tools.Group
+        Path.Log.debug("addToolController(%s): %s" % (tc.Label, [t.Label for t in group]))
+        if tc.Name not in [str(t.Name) for t in group]:
+            tc.setExpression(
+                "VertRapid",
+                "%s.%s"
+                % (
+                    self.obj.SetupSheet.Proxy.expressionReference(),
+                    PathSetupSheet.Template.VertRapid,
+                ),
+            )
+            tc.setExpression(
+                "HorizRapid",
+                "%s.%s"
+                % (
+                    self.obj.SetupSheet.Proxy.expressionReference(),
+                    PathSetupSheet.Template.HorizRapid,
+                ),
+            )
+            self.obj.Tools.addObject(tc)
+            Notification.updateTC.emit(self.obj, tc)
+
+    def allOperations(self):
+        ops = []
+
+        def collectBaseOps(op):
+            if hasattr(op, "TypeId"):
+                if op.TypeId == "Path::FeaturePython":
+                    ops.append(op)
+                    if hasattr(op, "Base"):
+                        collectBaseOps(op.Base)
+                if op.TypeId == "Path::FeatureCompoundPython":
+                    ops.append(op)
+                    for sub in op.Group:
+                        collectBaseOps(sub)
+
+        if getattr(self.obj, "Operations", None) and getattr(self.obj.Operations, "Group", None):
+            for op in self.obj.Operations.Group:
+                collectBaseOps(op)
+
+        return ops
+
+    def setCenterOfRotation(self, center):
+        if center != self.obj.Path.Center:
+            self.obj.Path.Center = center
+            for op in self.allOperations():
+                op.Path.Center = center
+
+    def integrityCheck(self, job):
+        """integrityCheck(job)... Return True if job has all expected children objects.  Attempts to restore any missing children."""
+        suffix = ""
+        if len(job.Name) > 3:
+            suffix = job.Name[3:]
+
+        def errorMessage(grp, job):
+            Path.Log.error("{} corrupt in {} job.".format(grp, job.Name))
+
+        if not job.Operations:
+            self.setupOperations(job)
+            job.Operations.Label = "Operations" + suffix
+            if not job.Operations:
+                errorMessage("Operations", job)
+                return False
+        if not job.SetupSheet:
+            self.setupSetupSheet(job)
+            job.SetupSheet.Label = "SetupSheet" + suffix
+            if not job.SetupSheet:
+                errorMessage("SetupSheet", job)
+                return False
+        if not job.Model:
+            self.setupBaseModel(job)
+            job.Model.Label = "Model" + suffix
+            if not job.Model:
+                errorMessage("Model", job)
+                return False
+        if not job.Stock:
+            self.setupStock(job)
+            job.Stock.Label = "Stock" + suffix
+            if not job.Stock:
+                errorMessage("Stock", job)
+                return False
+        if not job.Tools:
+            self.setupToolTable(job)
+            job.Tools.Label = "Tools" + suffix
+            if not job.Tools:
+                errorMessage("Tools", job)
+                return False
+        return True
+
+    @classmethod
+    def baseCandidates(cls):
+        """Answer all objects in the current document which could serve as a Base for a job."""
+        return sorted(
+            [obj for obj in FreeCAD.ActiveDocument.Objects if cls.isBaseCandidate(obj)],
+            key=lambda o: o.Label,
+        )
+
+    @classmethod
+    def isBaseCandidate(cls, obj):
+        """Answer true if the given object can be used as a Base for a job."""
+        return PathUtil.isValidBaseObject(obj)
+
+
+# Operation properties holding points picked in the 3D view, in the Job's coordinates.
+WORLD_POINTS = ("StartPoint", "EndPoint")
+# Operation and dressup properties holding points in the frame the operation generates in: the
+# Job's coordinates for ordinary Z-up milling, the work plane's for an indexed operation.
+FRAME_POINTS = ("CustomPoint1", "CustomPoint2", "PatternCenterCustom", "Centre")
+FRAME_POINT_LISTS = ("Locations", "Positions")
+# Operation and dressup properties holding heights, along the tool axis of the frame the
+# operation generates in.
+MODEL_HEIGHTS = (
+    "StartDepth",
+    "FinalDepth",
+    "SafeHeight",
+    "ClearanceHeight",
+    "ClearanceHeightOut",
+    "RetractHeight",
+    "DressupStartDepth",
+    "IgnoreOuterAbove",
+)
+
+
+def _operationsOf(job):
+    """The job's operations and dressups."""
+    from PathScripts import PathUtils
+
+    for obj in job.Document.Objects:
+        if not hasattr(obj, "Proxy") or not hasattr(obj, "Path"):
+            continue
+        if PathUtils.findParentJob(obj) == job:
+            yield obj
+
+
+def _moveInFrame(op, move, withModel=()):
+    """_moveInFrame(op, move, withModel=()) ... move, the Placement the model was moved by,
+    expressed in the frame op generates in. None when that frame is a work plane attached to
+    the model, or one of withModel, the objects moved as the model was: it moved with the model,
+    so nothing measured in it has moved."""
+    workplane = PathUtil.workplaneObjectForOp(op)
+    if workplane is not None and (
+        getattr(workplane, "AttachmentSupport", None) or workplane in withModel
+    ):
+        return None
+    frame = PathUtil.workplaneForOp(op)
+    if frame.isIdentity(1e-9):
+        return move
+    return frame.inverse().multiply(move).multiply(frame)
+
+
+def carryOperationPoints(job, move, withModel=()):
+    """carryOperationPoints(job, move, withModel=()) ... keep the points the job's operations and dressups have
+    on the model, such as their start and end points, where they are on it when the Job's origin
+    changes or the model is moved: moved by move, the Placement the model was moved by.
+
+    Start and end points are picked in the 3D view and kept in the Job's coordinates, so they
+    move with the model whatever frame the operation generates in. The other points are kept in
+    that frame: they move only as the model moves in the frame, and not at all when the frame is
+    a work plane attached to the model or one of withModel, the objects moved as the model was.
+    Points in lists keep their Z."""
+    for obj in _operationsOf(job):
+        for name in WORLD_POINTS:
+            value = getattr(obj, name, None)
+            if isinstance(value, FreeCAD.Vector):
+                setattr(obj, name, move.multVec(value))
+        inFrame = _moveInFrame(obj, move, withModel)
+        if inFrame is None:
+            continue
+        for name in FRAME_POINTS:
+            value = getattr(obj, name, None)
+            if isinstance(value, FreeCAD.Vector):
+                setattr(obj, name, inFrame.multVec(value))
+        for name in FRAME_POINT_LISTS:
+            values = getattr(obj, name, None)
+            if values and all(isinstance(v, FreeCAD.Vector) for v in values):
+                moved = []
+                for value in values:
+                    at = inFrame.multVec(value)
+                    moved.append(FreeCAD.Vector(at.x, at.y, value.z))
+                setattr(obj, name, moved)
+
+
+def carryOperationHeights(job, move, withModel=()):
+    """carryOperationHeights(job, move, withModel=()) ... when the model is moved by move, the Placement it was
+    moved by, raise or lower with it the heights the job's operations and dressups were given by
+    hand, such as a typed in final depth.
+
+    A height is a distance along the tool axis of the frame the operation generates in, so it
+    changes by the move's component along that axis: the whole of a move up or down for ordinary
+    Z-up milling, nothing when the frame is a work plane attached to the model or one of
+    withModel, the objects moved as the model was, and nothing when the model was turned. Heights calculated from the stock and model by
+    expression are left to be calculated again: every operation is marked to be recomputed."""
+    for obj in _operationsOf(job):
+        inFrame = _moveInFrame(obj, move, withModel)
+        dz = 0.0
+        if inFrame is not None and inFrame.Rotation.isIdentity(1e-9):
+            dz = inFrame.Base.z
+        if abs(dz) > 1e-9:
+            calculated = {name for name, _ in obj.ExpressionEngine}
+            for name in MODEL_HEIGHTS:
+                if name in calculated or not hasattr(obj, name):
+                    continue
+                height = getattr(obj, name)
+                setattr(obj, name, getattr(height, "Value", height) + dz)
+        obj.touch()
+
+
+def Create(name, base, templateFile=None):
+    """Create(name, base, templateFile=None) ... creates a new job and all it's resources.
+    If a template file is specified the new job is initialized with the values from the template."""
+    if isinstance(base[0], str):
+        models = []
+        for baseName in base:
+            models.append(FreeCAD.ActiveDocument.getObject(baseName))
+    else:
+        models = base
+    obj = FreeCAD.ActiveDocument.addObject("Path::FeaturePython", name)
+    obj.addExtension("App::GroupExtensionPython")
+    obj.Proxy = ObjectJob(obj, models, templateFile)
+    return obj

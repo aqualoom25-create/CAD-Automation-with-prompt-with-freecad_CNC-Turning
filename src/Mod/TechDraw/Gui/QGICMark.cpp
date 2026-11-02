@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+/***************************************************************************
+ *   Copyright (c) 2016 Wandererfan <WandererFan@gmail.com>                *
+ *                                                                         *
+ *   This file is part of the FreeCAD CAx development system.              *
+ *                                                                         *
+ *   This library is free software; you can redistribute it and/or         *
+ *   modify it under the terms of the GNU Library General Public           *
+ *   License as published by the Free Software Foundation; either          *
+ *   version 2 of the License, or (at your option) any later version.      *
+ *                                                                         *
+ *   This library  is distributed in the hope that it will be useful,      *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU Library General Public License for more details.                  *
+ *                                                                         *
+ *   You should have received a copy of the GNU Library General Public     *
+ *   License along with this library; see the file COPYING.LIB. If not,    *
+ *   write to the Free Software Foundation, Inc., 59 Temple Place,         *
+ *   Suite 330, Boston, MA  02111-1307, USA                                *
+ *                                                                         *
+ ***************************************************************************/
+
+# include <cassert>
+
+# include <QPainter>
+# include <QPainterPath>
+# include <QStyleOptionGraphicsItem>
+
+#include <App/Material.h>
+#include <Base/Parameter.h>
+#include <Mod/TechDraw/App/Preferences.h>
+
+#include "QGICMark.h"
+#include "DrawGuiUtil.h"
+#include "PreferencesGui.h"
+
+using namespace TechDraw;
+using namespace TechDrawGui;
+
+QGICMark::QGICMark(int index) : QGIVertex(index)
+{
+    m_markFuzz = DrawGuiUtil::screenWidth(PreferencesGui::markFuzz());
+    setThick(0.75);
+    draw();
+}
+void QGICMark::draw()
+{
+    double size = m_size * m_screenScale;
+    QPainterPath cmPath;
+    cmPath.moveTo(0.0, size);
+    cmPath.lineTo(0.0, -size);
+    cmPath.moveTo(size, 0.0);
+    cmPath.lineTo(-size, 0.0);
+    setPath(cmPath);
+
+    setWidth(m_thickness * m_screenScale);
+}
+
+void QGICMark::setSize(float s)
+{
+    m_size = s;
+    draw();
+}
+
+void QGICMark::setThick(float t)
+{
+    m_thickness = DrawGuiUtil::screenWidth(t);
+    draw();
+}
+
+void QGICMark::setScreenScale(double scale)
+{
+    ScreenScalable::setScreenScale(scale);
+    draw();
+}
+
+QColor QGICMark::getCMarkColor()
+{
+    return PreferencesGui::centerQColor();
+}
+
+void QGICMark::setPrettyNormal() {
+    m_pen.setColor(getCMarkColor());
+    update();
+}
+
+void QGICMark::paint(QPainter *painter, const QStyleOptionGraphicsItem *option, QWidget *widget)
+{
+    QStyleOptionGraphicsItem myOption(*option);
+    myOption.state &= ~QStyle::State_Selected;
+
+    QGIVertex::paint (painter, &myOption, widget);
+}
+
+QRectF QGICMark::boundingRect() const
+{
+    return shape().controlPointRect();
+}
+
+QPainterPath QGICMark::shape() const
+{
+    QPainterPath outline;
+    QPainterPathStroker stroker;
+    stroker.setWidth(m_markFuzz * m_screenScale);
+    outline = stroker.createStroke(path());
+    return outline;
+}

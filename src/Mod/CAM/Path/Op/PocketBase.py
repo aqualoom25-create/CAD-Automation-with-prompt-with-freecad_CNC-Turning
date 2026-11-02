@@ -1,0 +1,470 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-FileCopyrightText: 2017 sliptonic <shopinthewoods@gmail.com>
+# SPDX-FileCopyrightText: 2020 russ4262 (Russell Johnson)
+# SPDX-FileNotice: Part of the FreeCAD project.
+
+################################################################################
+#                                                                              #
+#   FreeCAD is free software: you can redistribute it and/or modify            #
+#   it under the terms of the GNU Lesser General Public License as             #
+#   published by the Free Software Foundation, either version 2.1              #
+#   of the License, or (at your option) any later version.                     #
+#                                                                              #
+#   FreeCAD is distributed in the hope that it will be useful,                 #
+#   but WITHOUT ANY WARRANTY; without even the implied warranty                #
+#   of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                    #
+#   See the GNU Lesser General Public License for more details.                #
+#                                                                              #
+#   You should have received a copy of the GNU Lesser General Public           #
+#   License along with FreeCAD. If not, see https://www.gnu.org/licenses       #
+#                                                                              #
+################################################################################
+
+import FreeCAD
+import Path
+import Path.Op.Area as PathAreaOp
+import Path.Op.Base as PathOp
+
+from PySide.QtCore import QT_TRANSLATE_NOOP
+
+__title__ = "Base CAM Pocket Operation"
+__author__ = "sliptonic (Brad Collette)"
+__url__ = "https://www.freecad.org"
+__doc__ = "Base class and implementation for pocket operations."
+
+if False:
+    Path.Log.setLevel(Path.Log.Level.DEBUG, Path.Log.thisModule())
+    Path.Log.trackModule(Path.Log.thisModule())
+else:
+    Path.Log.setLevel(Path.Log.Level.INFO, Path.Log.thisModule())
+
+translate = FreeCAD.Qt.translate
+
+
+class ObjectPocket(PathAreaOp.ObjectOp):
+    """Base class for proxy objects of all pocket operations."""
+
+    # ClearingPattern values a subclass does not support
+    excludedClearingPatterns = ()
+
+    @classmethod
+    def pocketPropertyEnumerations(cls, dataType="data"):
+        """pocketPropertyEnumerations(dataType="data")... return property enumeration lists of specified dataType.
+        Args:
+            dataType = 'data', 'raw', 'translated'
+        Notes:
+        'data' is list of internal string literals used in code
+        'raw' is list of (translated_text, data_string) tuples
+        'translated' is list of translated string literals
+        """
+
+        enums = {
+            "CutMode": [
+                (translate("CAM_Pocket", "Climb"), "Climb"),
+                (translate("CAM_Pocket", "Conventional"), "Conventional"),
+            ],  # this is the direction that the profile runs
+            "StartAt": [
+                (translate("CAM_Pocket", "Center"), "Center"),
+                (translate("CAM_Pocket", "Edge"), "Edge"),
+            ],
+            "ClearingPattern": [
+                (translate("CAM_Pocket", "ZigZag"), "ZigZag"),
+                (translate("CAM_Pocket", "Offset"), "Offset"),
+                (translate("CAM_Pocket", "Helix"), "Helix"),
+                (translate("CAM_Pocket", "Line"), "Line"),
+                (translate("CAM_Pocket", "Grid"), "Grid"),
+                (translate("CAM_Pocket", "No clearing"), "No clearing"),
+            ],  # Fill Pattern
+            "SortingMode": [
+                (translate("CAM_Pocket", "Automatic"), "Automatic"),
+                (translate("CAM_Pocket", "Manual"), "Manual"),
+            ],
+        }
+
+        enums["ClearingPattern"] = [
+            p for p in enums["ClearingPattern"] if p[1] not in cls.excludedClearingPatterns
+        ]
+
+        if dataType == "raw":
+            return enums
+
+        data = []
+        idx = 0 if dataType == "translated" else 1
+
+        Path.Log.debug(enums)
+
+        for k, v in enumerate(enums):
+            data.append((v, [tup[idx] for tup in enums[v]]))
+        Path.Log.debug(data)
+
+        return data
+
+    def areaOpFeatures(self, obj):
+        """areaOpFeatures(obj) ... Pockets have a FinishDepth and work on Faces"""
+        return PathOp.FeatureBaseFaces | PathOp.FeatureFinishDepth | self.pocketOpFeatures(obj)
+
+    def pocketOpFeatures(self, obj):
+        return 0
+
+    def initPocketOp(self, obj):
+        """initPocketOp(obj) ... overwrite to initialize subclass.
+        Can safely be overwritten by subclass."""
+
+    def opExecute(self, obj):
+        if len(obj.Base) == 0:
+            return
+        super().opExecute(obj)
+
+    def areaOpOnChanged(self, obj, prop):
+        if not obj.Document.Restoring:
+            finishingPassMode = 0 if obj.FinishingPasses else 2
+            obj.setEditorMode("FinishingOffset", finishingPassMode)
+            obj.setEditorMode("FinishingOneStepDown", finishingPassMode)
+            obj.setEditorMode("FinishingRampHelix", finishingPassMode)
+
+            if prop == "ClearingPattern":
+                startAtMode = 0 if obj.ClearingPattern in ("Offset", "Helix") else 2
+                obj.setEditorMode("StartAt", startAtMode)
+                patternsNoAngle = ("Offset", "Helix", "No clearing")
+                angleMode = 0 if obj.ClearingPattern not in patternsNoAngle else 2
+                obj.setEditorMode("Angle", angleMode)
+
+    def pocketInvertExtraOffset(self):
+        """pocketInvertExtraOffset() ... return True if ExtraOffset's direction is inward.
+        Can safely be overwritten by subclass."""
+        return False
+
+    def initAreaOp(self, obj):
+        """initAreaOp(obj) ... create pocket specific properties.
+        Do not overwrite, implement initPocketOp(obj) instead."""
+        Path.Log.track()
+
+        # Pocket Properties
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "CutMode",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "The direction that the toolpath should go around the part ClockWise (CW) or CounterClockWise (CCW)",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyDistance",
+            "ExtraOffset",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Extra offset to apply to the operation. Direction is operation dependent.",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "StartAt",
+            "Pocket",
+            QT_TRANSLATE_NOOP("App::Property", "Start pocketing at center or boundary"),
+        )
+        obj.addProperty(
+            "App::PropertyPercent",
+            "StepOver",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property", "Percent of cutter diameter to step over on each pass"
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyFloat",
+            "Angle",
+            "Pocket",
+            QT_TRANSLATE_NOOP("App::Property", "Angle of the grid, line and zigzag patterns"),
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "ClearingPattern",
+            "Pocket",
+            QT_TRANSLATE_NOOP("App::Property", "Clearing pattern to use"),
+        )
+        obj.addProperty(
+            "App::PropertyLength",
+            "RetractThreshold",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Set distance which will attempts to avoid unnecessary retractions.",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyBool",
+            "UseRestMachining",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Skips machining regions that have already been cleared by previous operations.",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyEnumeration",
+            "SortingMode",
+            "Path",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Order processing of the shapes"
+                "\nAutomatic: uses nearest neighbour algorithm to sort shapes"
+                "\nManual: uses order of shapes selection",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyBool",
+            "ForceMaxStepOver",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Force maximum stepover even if not all area is cleared. Without this flag set, the stepover may be reduced (for large stepover, >50%) to ensure full area coverage.",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyLength",
+            "FinishingOffset",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Distance between roughing and finishing passes",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyIntegerConstraint",
+            "FinishingPasses",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Adds an additional finishing pass "
+                "that clears the stock left over from tool deflection",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyBool",
+            "FinishingOneStepDown",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Finishing pass will processing with one step down at final depth",
+            ),
+        )
+        obj.addProperty(
+            "App::PropertyBool",
+            "FinishingRampHelix",
+            "Pocket",
+            QT_TRANSLATE_NOOP(
+                "App::Property",
+                "Create helix ramp for finishing pass",
+            ),
+        )
+
+        for n in self.pocketPropertyEnumerations():
+            setattr(obj, n[0], n[1])
+
+        self.initPocketOp(obj)
+
+    def areaOpUseProjection(self, obj):
+        """areaOpUseProjection(obj) ... return False"""
+        return False
+
+    def areaOpAreaParams(self, obj, isHole):
+        """areaOpAreaParams(obj, isHole) ... return dictionary with pocket's area parameters"""
+        Path.Log.track()
+        params = {}
+        params["Fill"] = 0
+        params["Coplanar"] = 0
+        params["PocketMode"] = 1
+        params["SectionCount"] = -1
+        params["Angle"] = obj.Angle
+        params["FromCenter"] = obj.StartAt == "Center"
+        params["PocketStepover"] = (self.radius * 2) * (float(obj.StepOver) / 100)
+        extraOffset = obj.ExtraOffset.Value
+        if self.pocketInvertExtraOffset():
+            extraOffset = -extraOffset
+        if obj.FinishingPasses:
+            # leave stock for the finishing pass, always inward
+            extraOffset += obj.FinishingOffset.Value
+        params["PocketExtraOffset"] = extraOffset
+        params["ToolRadius"] = self.radius
+        params["ForceMaxStepover"] = obj.ForceMaxStepOver
+
+        Pattern = {
+            "ZigZag": 1,
+            "Offset": 2,
+            "Spiral": 3,
+            "ZigZagOffset": 1,  # 4,
+            "Line": 5,
+            "Grid": 6,
+            "Triangle": 7,
+            "Helix": 2,
+        }
+
+        params["PocketMode"] = Pattern.get(obj.ClearingPattern, 1)
+
+        if obj.SplitArcs:
+            params["Explode"] = True
+            params["FitArcs"] = False
+
+        return params
+
+    def areaOpAreaParamsFinishing(self, obj, isHole):
+        """areaOpAreaParamsOffset(obj, isHole) ... return dictionary with area parameters
+        This AreaParams using for Finishing Offset passes"""
+        params = {}
+        params["Fill"] = 0
+        params["Coplanar"] = 0
+        params["SectionCount"] = -1
+        extraOffset = obj.ExtraOffset.Value
+        if self.pocketInvertExtraOffset():
+            extraOffset = -extraOffset
+        params["Offset"] = -(self.radius + extraOffset)
+        params["ExtraPass"] = 0
+        params["Stepover"] = 0
+
+        return params
+
+    def opOnDocumentRestored(self, obj):
+        super().opOnDocumentRestored(obj)
+        if not hasattr(obj, "UseRestMachining"):
+            obj.addProperty(
+                "App::PropertyBool",
+                "UseRestMachining",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Skips machining regions that have already been cleared by previous operations.",
+                ),
+            )
+        if not hasattr(obj, "ForceMaxStepOver"):
+            obj.addProperty(
+                "App::PropertyBool",
+                "ForceMaxStepOver",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Force maximum stepover even if not all area is cleared. Without this flag set, the stepover may be reduced (for large stepover, >50%) to ensure full area coverage.",
+                ),
+            )
+        if not hasattr(obj, "RetractThreshold"):
+            obj.addProperty(
+                "App::PropertyLength",
+                "RetractThreshold",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Set distance which will attempts to avoid unnecessary retractions.",
+                ),
+            )
+        if not hasattr(obj, "SortingMode"):
+            obj.addProperty(
+                "App::PropertyEnumeration",
+                "SortingMode",
+                "Path",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Order processing of the shapes"
+                    "\nAutomatic: uses nearest neighbour algorithm to sort shapes"
+                    "\nManual: uses order of shapes selection",
+                ),
+            )
+            obj.SortingMode = ("Automatic", "Manual")
+        if hasattr(obj, "ZigZagAngle"):
+            obj.renameProperty("ZigZagAngle", "Angle")
+        if hasattr(obj, "OffsetPattern"):
+            obj.setGroupOfProperty("OffsetPattern", "Pocket")
+            obj.renameProperty("OffsetPattern", "ClearingPattern")
+        if hasattr(obj, "RestMachiningRegions"):
+            obj.removeProperty("RestMachiningRegions")
+        if hasattr(obj, "RestMachiningRegionsNeedRecompute"):
+            obj.removeProperty("RestMachiningRegionsNeedRecompute")
+        if hasattr(obj, "KeepToolDown"):
+            if obj.KeepToolDown:
+                obj.setExpression("RetractThreshold", "1 * OpToolDiameter")
+            obj.removeProperty("KeepToolDown")
+        if hasattr(obj, "PocketLastStepOver"):
+            obj.removeProperty("PocketLastStepOver")
+
+        if not hasattr(obj, "FinishingOffset"):
+            obj.addProperty(
+                "App::PropertyLength",
+                "FinishingOffset",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property", "Distance between roughing and finishing passes"
+                ),
+            )
+            if obj.ClearingPattern == "ZigZagOffset":
+                obj.FinishingOffset = 0.01
+        if not hasattr(obj, "FinishingOneStepDown"):
+            obj.addProperty(
+                "App::PropertyBool",
+                "FinishingOneStepDown",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Finishing pass will processing with one step down at final depth",
+                ),
+            )
+        if not hasattr(obj, "FinishingPasses"):
+            obj.addProperty(
+                "App::PropertyIntegerConstraint",
+                "FinishingPasses",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Adds an additional finishing pass "
+                    "that clears the stock left over from tool deflection",
+                ),
+            )
+            obj.FinishingPasses = (0, 0, 999999, 1)
+            # ZigZagOffset is replaced by ZigZag with a finishing pass
+            obj.FinishingPasses = 1 if obj.ClearingPattern == "ZigZagOffset" else 0
+        if not hasattr(obj, "FinishingRampHelix"):
+            obj.addProperty(
+                "App::PropertyBool",
+                "FinishingRampHelix",
+                "Pocket",
+                QT_TRANSLATE_NOOP(
+                    "App::Property",
+                    "Create helix ramp for finishing pass",
+                ),
+            )
+        if hasattr(obj, "MinTravel"):
+            obj.removeProperty("MinTravel")
+
+        patterns = dict(self.pocketPropertyEnumerations())["ClearingPattern"]
+        if obj.getEnumerationsOfProperty("ClearingPattern") != patterns:
+            pattern = obj.ClearingPattern
+            if pattern == "ZigZagOffset":
+                pattern = "ZigZag"
+            obj.ClearingPattern = patterns
+            obj.ClearingPattern = pattern if pattern in patterns else patterns[0]
+
+        Path.Log.track()
+
+    def areaOpPathParams(self, obj, isHole):
+        """areaOpAreaParams(obj, isHole) ... return dictionary with pocket's path parameters"""
+        params = {}
+
+        CutMode = ("Conventional", "Climb")
+        params["orientation"] = CutMode.index(obj.CutMode)
+
+        return params
+
+
+def SetupProperties():
+    setup = PathAreaOp.SetupProperties()
+    setup.append("Angle")
+    setup.append("ClearingPattern")
+    setup.append("CutMode")
+    setup.append("ExtraOffset")
+    setup.append("FinishingPasses")
+    setup.append("FinishingOffset")
+    setup.append("FinishingOneStepDown")
+    setup.append("FinishingRampHelix")
+    setup.append("StartAt")
+    setup.append("StepDown")
+    setup.append("StepOver")
+    return setup

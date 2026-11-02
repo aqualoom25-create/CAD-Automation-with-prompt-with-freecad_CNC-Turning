@@ -1,0 +1,93 @@
+
+                        S T E P       1
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+        1.371125E-14  7.138647E-14  2.100000E+01
+
+     B U C K L I N G   F A C T O R   O U T P U T
+
+ MODE NO       BUCKLING
+                FACTOR
+
+      1   0.4833332E+02
+      2   0.1066504E+03
+      3   0.4004048E+03
+      4   0.7914648E+03
+      5   0.9662154E+03
+      6   0.1594441E+04
+      7   0.1661131E+04
+      8   0.2198302E+04
+      9   0.2428174E+04
+     10   0.2743332E+04
+
+                    E I G E N V A L U E    N U M B E R     1
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+        2.209588E-01 -8.664591E-05  1.476945E-06
+
+                    E I G E N V A L U E    N U M B E R     2
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -1.018761E-03 -3.778412E-01  8.207029E-03
+
+                    E I G E N V A L U E    N U M B E R     3
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -1.975498E+00  3.533233E-04 -6.171130E-04
+
+                    E I G E N V A L U E    N U M B E R     4
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -1.434059E-02 -3.058188E+00  5.452138E-02
+
+                    E I G E N V A L U E    N U M B E R     5
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -5.480496E+00  6.121418E-03 -4.007323E-03
+
+                    E I G E N V A L U E    N U M B E R     6
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -1.089269E+01  3.046477E-02 -1.118121E-02
+
+                    E I G E N V A L U E    N U M B E R     7
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+        6.018492E-02  7.509214E+00 -9.558287E-02
+
+                    E I G E N V A L U E    N U M B E R     8
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -1.784118E+01  3.410029E-02 -1.790940E-02
+
+                    E I G E N V A L U E    N U M B E R     9
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+        1.639572E-01  1.345149E+01 -1.126012E-01
+
+                    E I G E N V A L U E    N U M B E R    10
+
+
+ total force (fx,fy,fz) for set FIXED and time  0.0000000E+00
+
+       -2.776167E+01 -1.233096E-01 -1.571306E-02

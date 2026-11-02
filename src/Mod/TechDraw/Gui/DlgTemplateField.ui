@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>TechDrawGui::dlgTemplateField</class>
+ <widget class="QDialog" name="TechDrawGui::dlgTemplateField">
+  <property name="windowModality">
+   <enum>Qt::ApplicationModal</enum>
+  </property>
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>340</width>
+    <height>132</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Change Editable Field</string>
+  </property>
+  <property name="modal">
+   <bool>true</bool>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <layout class="QFormLayout" name="formLayout">
+     <item row="0" column="0">
+      <widget class="QLabel" name="lblMsg">
+       <property name="text">
+        <string>Text name</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1">
+      <widget class="QLabel" name="lblName">
+       <property name="text">
+        <string>Name</string>
+       </property>
+       <property name="font">
+        <font>
+         <bold>true</bold>
+        </font>
+       </property>
+       <property name="textInteractionFlags">
+        <enum>Qt::TextSelectableByMouse</enum>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLabel" name="label">
+       <property name="text">
+        <string>Value</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="TechDrawGui::LineEditFrame" name="leFrame">
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="readOnly">
+        <bool>true</bool>
+       </property>
+       <layout class="QHBoxLayout" name="editLayout">
+        <property name="leftMargin">
+         <number>1</number>
+        </property>
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <item>
+         <widget class="Gui::ExpLineEdit" name="leInput">
+          <property name="frame">
+           <bool>false</bool>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="2" column="0">
+      <widget class="QPushButton" name="btnAutofill">
+       <property name="toolTip">
+        <string>Applies autofill to this field</string>
+       </property>
+       <property name="text">
+        <string>Autofill</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="1">
+      <widget class="QLineEdit" name="leAutofill">
+       <property name="readOnly">
+        <bool>true</bool>
+       </property>
+       <property name="toolTip">
+        <string>The autofill replacement value</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="bbButtons">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <property name="standardButtons">
+      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
+     </property>
+     <property name="centerButtons">
+      <bool>false</bool>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>Gui::ExpLineEdit</class>
+   <extends>QLineEdit</extends>
+   <header>Gui/Widgets.h</header>
+  </customwidget>
+  <customwidget>
+   <class>TechDrawGui::LineEditFrame</class>
+   <extends>QLineEdit</extends>
+   <header>Mod/TechDraw/Gui/DlgTemplateField.h</header>
+  </customwidget>
+ </customwidgets>
+ <layoutdefault spacing="6" margin="9"/>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>bbButtons</sender>
+   <signal>accepted()</signal>
+   <receiver>TechDrawGui::dlgTemplateField</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>209</x>
+     <y>126</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>209</x>
+     <y>79</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>bbButtons</sender>
+   <signal>rejected()</signal>
+   <receiver>TechDrawGui::dlgTemplateField</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>209</x>
+     <y>126</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>209</x>
+     <y>79</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

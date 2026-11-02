@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+# ***************************************************************************
+# *   Copyright (c) 2009, 2010 Yorik van Havre <yorik@uncreated.net>        *
+# *   Copyright (c) 2009, 2010 Ken Cline <cline@frii.com>                   *
+# *   Copyright (c) 2020 FreeCAD Developers                                 *
+# *                                                                         *
+# *   This program is free software; you can redistribute it and/or modify  *
+# *   it under the terms of the GNU Lesser General Public License (LGPL)    *
+# *   as published by the Free Software Foundation; either version 2 of     *
+# *   the License, or (at your option) any later version.                   *
+# *   for detail see the LICENCE text file.                                 *
+# *                                                                         *
+# *   This program is distributed in the hope that it will be useful,       *
+# *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+# *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+# *   GNU Library General Public License for more details.                  *
+# *                                                                         *
+# *   You should have received a copy of the GNU Library General Public     *
+# *   License along with this program; if not, write to the Free Software   *
+# *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  *
+# *   USA                                                                   *
+# *                                                                         *
+# ***************************************************************************
+"""Provides functions to create Shape2DView objects."""
+
+## @package make_shape2dview
+# \ingroup draftmake
+# \brief Provides functions to create Shape2DView objects.
+
+## \addtogroup draftmake
+# @{
+import FreeCAD as App
+from draftobjects.shape2dview import Shape2DView
+from draftutils import gui_utils
+from freecad.deprecation import deprecated
+
+if App.GuiUp:
+    from draftviewproviders.view_base import ViewProviderDraftAlt
+
+
+def make_shape_2d_view(baseobj, projection=None, facenumbers=[]):
+    """make_shape_2d_view(baseobj, [projection], [facenumbers])
+
+    Add a 2D shape to the document, which is a 2D projection of the given object.
+
+    Parameters
+    ----------
+    baseobj :
+        TODO: Describe
+
+    projection : Base.Vector
+        Custom vector for the projection
+
+    facenumbers : [] TODO: Describe
+        A list of face numbers to be considered in individual faces mode.
+    """
+    if not App.ActiveDocument:
+        App.Console.PrintError("No active document. Aborting\n")
+        return
+    obj = App.ActiveDocument.addObject("Part::Part2DObjectPython", "Shape2DView")
+    Shape2DView(obj)
+    if App.GuiUp:
+        ViewProviderDraftAlt(obj.ViewObject)
+    obj.Base = baseobj
+    if projection:
+        obj.Projection = projection
+    if facenumbers:
+        obj.FaceNumbers = facenumbers
+    gui_utils.select(obj)
+
+    return obj
+
+
+@deprecated(
+    deprecated_in="26.3",
+    removed_in="28.3",
+    replacement="Draft.make_shape_2d_view()",
+)
+def make_shape2dview(baseobj, projectionVector=None, facenumbers=[]):
+    """DEPRECATED. Use 'make_shape_2d_view'."""
+    return make_shape_2d_view(baseobj, projection=projectionVector, facenumbers=facenumbers)
+
+
+@deprecated(
+    deprecated_in="26.3",
+    removed_in="28.3",
+    replacement="Draft.make_shape_2d_view()",
+)
+def makeShape2DView(baseobj, projectionVector=None, facenumbers=[]):
+    """DEPRECATED. Use 'make_shape_2d_view'."""
+    return make_shape_2d_view(baseobj, projection=projectionVector, facenumbers=facenumbers)
+
+
+## @}
