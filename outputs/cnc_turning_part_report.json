@@ -6,10 +6,10 @@
       "width": 400,
       "height": 400,
       "bbox": [
-        88,
-        28,
-        304,
-        367
+        89,
+        29,
+        303,
+        366
       ]
     },
     "calibration_scale_mm_per_px": 0.15,
@@ -45,6 +45,7 @@
       "rmse_deviation_mm": 0.02,
       "all_features_within_0_5mm_tolerance": true
     },
+    "archetype": "hex_threaded_probe",
     "step_brep_validation": {
       "file_name": "cnc_turning_part.step",
       "file_size_bytes": 858693,

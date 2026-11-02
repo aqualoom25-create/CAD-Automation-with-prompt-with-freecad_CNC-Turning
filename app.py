@@ -456,9 +456,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card">
           <div class="card-header">
             <h2>&#128228; Input Tab — Upload Any CNC Turning Part Image</h2>
-            <button type="button" class="btn" onclick="resetToReference()" title="Restore default threaded hex sensor probe">
-              &#8635; Load Reference Hex Probe
-            </button>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button type="button" class="btn primary" onclick="loadPreset('hex_probe')" title="Load Hex Threaded Sensor Probe (Turning_prt.jpg)">
+                &#9881; Part 1: Hex Threaded Probe
+              </button>
+              <button type="button" class="btn amber" onclick="loadPreset('spool_shaft')" title="Load Multi-Groove Threaded Spool Shaft (Truning.jpg)">
+                &#9881; Part 2: Multi-Groove Spool Shaft
+              </button>
+            </div>
           </div>
 
           <form id="uploadConvertForm" onsubmit="handleUploadConvert(event)">
@@ -765,14 +770,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
 
-    async function resetToReference() {
+    async function loadPreset(presetName) {
       const btn = document.getElementById('convertBtn');
       const banner = document.getElementById('statusBanner');
       btn.disabled = true;
       banner.style.display = 'block';
-      banner.textContent = 'Restoring Reference Hex + 3D Helical Thread Probe Part...';
+      banner.textContent = 'Loading & Converting Preset Turning Part (' + presetName + ')...';
       try {
-        const res = await fetch('/api/reset_reference', { method: 'POST' });
+        const res = await fetch('/api/load_preset/' + presetName, { method: 'POST' });
         if (res.ok) window.location.reload();
       } finally {
         btn.disabled = false;
@@ -950,20 +955,30 @@ def api_upload_convert():
         return jsonify({"status": "error", "error": str(e)}), 400
 
 
-@app.route("/api/reset_reference", methods=["POST"])
-def api_reset_reference():
-    ref_path = os.path.join(BASE_DIR, "reference_turning_part.png")
-    set_active_image_path(ref_path)
+@app.route("/api/load_preset/<preset_name>", methods=["POST"])
+def api_load_preset(preset_name):
+    if preset_name == "spool_shaft":
+        spool_candidates = [
+            os.path.join(UPLOAD_DIR, "1793630957_Truning.jpg"),
+            os.path.join(BASE_DIR, "reference_spool_shaft.jpg"),
+        ]
+        target = next((p for p in spool_candidates if os.path.exists(p)), os.path.join(BASE_DIR, "reference_turning_part.png"))
+        scale = 0.2000
+    else:
+        target = os.path.join(BASE_DIR, "reference_turning_part.png")
+        scale = 0.1500
+
+    set_active_image_path(target)
     convert_any_turning_image_to_step(
-        ref_path,
+        target,
         out_dir=OUT_DIR,
         repo_dir=BASE_DIR,
         tol_mm=0.50,
-        scale_mm_per_px=0.1500,
+        scale_mm_per_px=scale,
         orientation="auto",
         helical_threads=True,
     )
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "preset": preset_name})
 
 
 if __name__ == "__main__":
