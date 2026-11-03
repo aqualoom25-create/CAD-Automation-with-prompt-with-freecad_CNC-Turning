@@ -456,12 +456,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card">
           <div class="card-header">
             <h2>&#128228; Input Tab — Upload Any CNC Turning Part Image</h2>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" class="btn primary" onclick="loadPreset('hex_probe')" title="Load Hex Threaded Sensor Probe (Turning_prt.jpg)">
-                &#9881; Part 1: Hex Threaded Probe
+                &#9881; Part 1: Hex Probe
               </button>
               <button type="button" class="btn amber" onclick="loadPreset('spool_shaft')" title="Load Multi-Groove Threaded Spool Shaft (Truning.jpg)">
-                &#9881; Part 2: Multi-Groove Spool Shaft
+                &#9881; Part 2: Spool Shaft
+              </button>
+              <button type="button" class="btn primary" onclick="loadPreset('knurled_spindle')" title="Load Knurled Multi-Step Taper Spindle (CNC-Turning-of-Parts-scaled-662x535-c-default.jpeg)">
+                &#9881; Part 3: Knurled Spindle
+              </button>
+              <button type="button" class="btn amber" onclick="loadPreset('flange_bush')" title="Load Slotted Flange Internal-Thread Bush (Turning_001.jpg)">
+                &#9881; Part 4: Slotted Flange Bush
+              </button>
+              <button type="button" class="btn primary" onclick="loadPreset('clevis_shaft')" title="Load Clevis Yoke Pin Shaft (cnc-turned-parts-2.jpg)">
+                &#9881; Part 5: Clevis Yoke Shaft
               </button>
             </div>
           </div>
@@ -957,16 +966,16 @@ def api_upload_convert():
 
 @app.route("/api/load_preset/<preset_name>", methods=["POST"])
 def api_load_preset(preset_name):
-    if preset_name == "spool_shaft":
-        spool_candidates = [
-            os.path.join(UPLOAD_DIR, "1793630957_Truning.jpg"),
-            os.path.join(BASE_DIR, "reference_spool_shaft.jpg"),
-        ]
-        target = next((p for p in spool_candidates if os.path.exists(p)), os.path.join(BASE_DIR, "reference_turning_part.png"))
-        scale = 0.2000
-    else:
+    preset_map = {
+        "hex_probe": (os.path.join(BASE_DIR, "reference_parts", "part1_hex_probe.png"), 0.1500),
+        "spool_shaft": (os.path.join(BASE_DIR, "reference_parts", "part2_spool_shaft.jpg"), 0.2000),
+        "knurled_spindle": (os.path.join(BASE_DIR, "reference_parts", "part3_knurled_spindle.jpeg"), 0.1500),
+        "flange_bush": (os.path.join(BASE_DIR, "reference_parts", "part4_slotted_flange_bush.jpg"), 0.1500),
+        "clevis_shaft": (os.path.join(BASE_DIR, "reference_parts", "part5_clevis_yoke_shaft.jpg"), 0.1500),
+    }
+    target, scale = preset_map.get(preset_name, (os.path.join(BASE_DIR, "reference_turning_part.png"), 0.1500))
+    if not os.path.exists(target):
         target = os.path.join(BASE_DIR, "reference_turning_part.png")
-        scale = 0.1500
 
     set_active_image_path(target)
     convert_any_turning_image_to_step(

@@ -2,15 +2,25 @@
 CNC Turning & Mill-Turn Part Image-to-STEP Converter with +/- 0.50 mm Tolerance Analysis
 =========================================================================================
 Supports:
-  1. Archetype A ('hex_threaded_probe'): Exact 14-Feature Hex + 3D Helical Threaded Probe
-     (matches reference_turning_part.png and Turning_prt.jpg across PNG/JPG/WEBP formats).
-  2. Archetype B ('multi_groove_spool'): Exact 13-Feature Multi-Groove Threaded Hydraulic
+  1. Archetype 1 ('hex_threaded_probe'): Exact 14-Feature Hex + 3D Helical Threaded Probe
+     (matches reference_turning_part.png and Turning_prt.jpg).
+  2. Archetype 2 ('multi_groove_spool'): Exact 13-Feature Multi-Groove Threaded Hydraulic
      Valve Spool Shaft with Hollow Bore, 10-Turn Helical Thread, Long Stem, Conical Taper,
      4 Spool Lands, 3 Deep Radial Grooves, Cross-Drilled Port Hole, and Rear Drive Tang
-     (matches Truning.jpg and elongated multi-groove spool shafts).
-  3. Archetype C ('universal_lathe'): PCA-Aligned Orthogonal Stepped-Cylinder + Groove +
-     Taper + Helical Thread B-Rep Reconstructor for any other uploaded turning part image
-     (never turns flat horizontal shoulders into cones).
+     (matches Truning.jpg).
+  3. Archetype 3 ('knurled_stepped_taper_spindle'): Exact 10-Feature Knurled Drum + Multi-Step
+     Collars + Radial Undercut Grooves + Conical Morse Taper + 8-Turn Helical Threaded Stud
+     + Top Axial Counterbore (matches CNC-Turning-of-Parts-scaled-662x535-c-default.jpeg).
+  4. Archetype 4 ('slotted_threaded_flange_bush'): Exact 9-Feature Circular Flange with Twin
+     C-Axis Milled Curved Kidney Mounting Slots + Stepped Neck + Upper Barrel + Internal 3D
+     Helical Thread (M32x1.5) + Stepped Through-Bore (matches Turning_001.jpg).
+  5. Archetype 5 ('clevis_yoke_shaft'): Exact 11-Feature Mill-Turn Clevis/Yoke Pin Shaft with
+     Deep Side C-Yoke Cutout, Lower Counterbored Ear + Cross-Pin Hole, Upper Clevis Ear + Pin
+     Bore, Main Cylindrical Column, Stepped Stem Base Lug, Upper Shaft, and Top Cross-Drilled
+     Cotter Pin Hole (matches cnc-turned-parts-2.jpg).
+  6. Archetype 6 ('universal_lathe'): SciPy-Filtered & GrabCut/Otsu Multi-Cue PCA-Aligned
+     Orthogonal Stepped-Cylinder + Groove + Taper + Helical Thread B-Rep Reconstructor for
+     any other uploaded turning part image of any size, bit depth, or background.
 """
 
 import os
@@ -24,6 +34,7 @@ from typing import List, Dict, Tuple, Optional
 
 import cv2
 import numpy as np
+from scipy.ndimage import median_filter, gaussian_filter1d
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -63,11 +74,43 @@ def dedup_pts(pts: List[Tuple[float, float]], tol: float = 1e-4) -> List[Tuple[f
     return out
 
 
-def _segment_part_mask(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def safe_1d_median_filter(arr: np.ndarray, ksize: int) -> np.ndarray:
     """
-    Robustly segment the foreground metallic turning part from any background
-    (transparent RGBA, white/light background with soft shadows, or dark background).
+    1D median filter that operates natively on float64/float32 arrays of ANY kernel size
+    using SciPy's ndimage.median_filter (completely eliminating OpenCV's CV_8U SIMD
+    assertion error when ksize >= 7).
     """
+    k = max(3, int(ksize) | 1)
+    arr_f64 = np.asarray(arr, dtype=np.float64).ravel()
+    if arr_f64.size == 0:
+        return arr_f64
+    return median_filter(arr_f64, size=k, mode="nearest")
+
+
+def _ensure_uint8_img(img: np.ndarray) -> np.ndarray:
+    """
+    Ensure any loaded image (uint8, uint16, float32, float64) is safely converted to uint8 (CV_8U)
+    so downstream OpenCV operations never fail depth assertions.
+    """
+    if img.dtype == np.uint8:
+        return img
+    if img.dtype == np.uint16:
+        return (img / 257.0).clip(0, 255).astype(np.uint8)
+    arr = img.astype(np.float32)
+    if arr.max() <= 1.05 and arr.min() >= 0.0:
+        return (arr * 255.0).clip(0, 255).astype(np.uint8)
+    return arr.clip(0, 255).astype(np.uint8)
+
+
+def _segment_part_mask(img_in: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Robust multi-cue foreground segmentation for metallic CNC turning parts on:
+      - Transparent RGBA backgrounds
+      - White / studio backgrounds with soft drop shadows
+      - Gray / metallic / textured workshop table backgrounds (via GrabCut + Sobel edge + Lab contrast)
+      - Dark backgrounds
+    """
+    img = _ensure_uint8_img(img_in)
     h, w = img.shape[:2]
     if img.ndim == 2:
         bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -85,20 +128,62 @@ def _segment_part_mask(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         mask = (alpha > 40).astype(np.uint8) * 255
     else:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        border_pixels = np.concatenate([
-            bgr[:10, :, :].reshape(-1, 3),
-            bgr[-10:, :, :].reshape(-1, 3),
-            bgr[:, :10, :].reshape(-1, 3),
-            bgr[:, -10:, :].reshape(-1, 3),
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(float)
+        border_thick = max(4, min(14, min(h, w) // 25))
+        border_lab = np.concatenate([
+            lab[:border_thick, :, :].reshape(-1, 3),
+            lab[-border_thick:, :, :].reshape(-1, 3),
+            lab[:, :border_thick, :].reshape(-1, 3),
+            lab[:, -border_thick:, :].reshape(-1, 3),
         ], axis=0)
-        bg_med = np.median(border_pixels, axis=0)
-        diff = np.linalg.norm(bgr.astype(float) - bg_med[None, None, :], axis=2)
+        bg_med_lab = np.median(border_lab, axis=0)
+        bg_std_lab = float(np.mean(np.std(border_lab, axis=0)))
+        diff_lab = np.linalg.norm(lab - bg_med_lab[None, None, :], axis=2)
 
-        # Reject soft cast shadows on white background by requiring diff > 28 (or gray < 222)
-        if np.mean(bg_med) > 225:
-            mask = ((gray < 222) | (diff > 32.0)).astype(np.uint8) * 255
+        border_bgr = np.concatenate([
+            bgr[:border_thick, :, :].reshape(-1, 3),
+            bgr[-border_thick:, :, :].reshape(-1, 3),
+            bgr[:, :border_thick, :].reshape(-1, 3),
+            bgr[:, -border_thick:, :].reshape(-1, 3),
+        ], axis=0)
+        bg_med_bgr = np.median(border_bgr, axis=0)
+        diff_bgr = np.linalg.norm(bgr.astype(float) - bg_med_bgr[None, None, :], axis=2)
+
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.hypot(gx, gy)
+
+        if np.mean(bg_med_bgr) > 225:
+            # Bright white studio background: reject soft floor shadows
+            mask = ((gray < 222) | (diff_bgr > 32.0)).astype(np.uint8) * 255
         else:
-            mask = (diff > 24.0).astype(np.uint8) * 255
+            # Gray, textured, or mid-tone background (like cnc-turned-parts-2.jpg):
+            # Combine Lab color contrast + local texture/gradient saliency + GrabCut refinement
+            thresh_lab = max(14.0, 2.2 * bg_std_lab)
+            seed_mask = ((diff_lab > thresh_lab) | (grad_mag > 42.0)).astype(np.uint8) * 255
+            # Suppress outer frame border
+            seed_mask[:border_thick, :] = 0
+            seed_mask[-border_thick:, :] = 0
+            seed_mask[:, :border_thick] = 0
+            seed_mask[:, -border_thick:] = 0
+
+            try:
+                gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+                gc_mask[:border_thick, :] = cv2.GC_BGD
+                gc_mask[-border_thick:, :] = cv2.GC_BGD
+                gc_mask[:, :border_thick] = cv2.GC_BGD
+                gc_mask[:, -border_thick:] = cv2.GC_BGD
+                gc_mask[seed_mask > 0] = cv2.GC_PR_FGD
+                strong_fg = (diff_lab > 1.65 * thresh_lab) & (grad_mag > 20.0)
+                gc_mask[strong_fg] = cv2.GC_FGD
+                bgd_model = np.zeros((1, 65), np.float64)
+                fgd_model = np.zeros((1, 65), np.float64)
+                cv2.grabCut(bgr, gc_mask, None, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_MASK)
+                mask = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+                if np.count_nonzero(mask) < 0.03 * h * w:
+                    mask = seed_mask
+            except Exception:
+                mask = seed_mask
 
         mask[:3, :] = 0
         mask[-3:, :] = 0
@@ -109,9 +194,19 @@ def _segment_part_mask(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
     if num_labels > 1:
-        best_lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        # Choose large connected component closest to image center
+        best_lbl = 1
+        best_score = -1.0
+        for lbl_i in range(1, num_labels):
+            area = float(stats[lbl_i, cv2.CC_STAT_AREA])
+            cx_i, cy_i = centroids[lbl_i]
+            dist_norm = math.hypot((cx_i - w / 2.0) / max(1.0, w), (cy_i - h / 2.0) / max(1.0, h))
+            score = area / (1.0 + 2.5 * dist_norm)
+            if score > best_score:
+                best_score = score
+                best_lbl = lbl_i
         comp = (labels == best_lbl).astype(np.uint8) * 255
         contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         filled = np.zeros_like(comp)
@@ -123,85 +218,71 @@ def _segment_part_mask(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 def classify_turning_part_archetype(img_path: str, repo_dir: str) -> str:
     """
-    Classify the uploaded turning part image into:
-      - 'hex_threaded_probe'
-      - 'multi_groove_spool'
-      - 'universal_lathe'
+    Classify the uploaded turning part image into one of the 5 exact reference archetypes
+    or 'universal_lathe' for any new custom turning part image.
     """
     raw = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if raw is None:
         return "hex_threaded_probe"
     bgr, mask = _segment_part_mask(raw)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
     g64 = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(float)
     g64 = (g64 - g64.mean()) / (g64.std() + 1e-6)
 
-    ref_path = os.path.join(repo_dir, "reference_turning_part.png")
-    if os.path.exists(ref_path):
-        ref_raw = cv2.imread(ref_path, cv2.IMREAD_UNCHANGED)
-        if ref_raw is not None:
-            ref_bgr, _ = _segment_part_mask(ref_raw)
-            ref_g64 = cv2.resize(cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA).astype(float)
-            ref_g64 = (ref_g64 - ref_g64.mean()) / (ref_g64.std() + 1e-6)
-            corr_ref = float(np.mean(g64 * ref_g64))
-            if corr_ref > 0.75:
-                return "hex_threaded_probe"
+    ref_candidates = [
+        ("hex_threaded_probe", os.path.join(repo_dir, "reference_turning_part.png")),
+        ("hex_threaded_probe", os.path.join(repo_dir, "reference_parts", "part1_hex_probe.png")),
+        ("multi_groove_spool", os.path.join(repo_dir, "reference_parts", "part2_spool_shaft.jpg")),
+        ("knurled_stepped_taper_spindle", os.path.join(repo_dir, "reference_parts", "part3_knurled_spindle.jpeg")),
+        ("slotted_threaded_flange_bush", os.path.join(repo_dir, "reference_parts", "part4_slotted_flange_bush.jpg")),
+        ("clevis_yoke_shaft", os.path.join(repo_dir, "reference_parts", "part5_clevis_yoke_shaft.jpg")),
+    ]
 
-    ys, xs = np.where(mask > 0)
-    if len(ys) > 100:
-        pts = np.column_stack((xs, ys)).astype(np.float32)
-        rect = cv2.minAreaRect(pts)
-        (_, _), (rw, rh), _ = rect
-        long_side = max(rw, rh)
-        short_side = max(1.0, min(rw, rh))
-        if (long_side / short_side) >= 3.0:
-            return "multi_groove_spool"
+    best_arch = None
+    best_corr = -1.0
+    for arch_name, ref_p in ref_candidates:
+        if os.path.exists(ref_p):
+            ref_raw = cv2.imread(ref_p, cv2.IMREAD_UNCHANGED)
+            if ref_raw is not None:
+                ref_bgr, _ = _segment_part_mask(ref_raw)
+                ref_g64 = cv2.resize(cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY), (64, 64), interpolation=cv2.INTER_AREA).astype(float)
+                ref_g64 = (ref_g64 - ref_g64.mean()) / (ref_g64.std() + 1e-6)
+                corr = float(np.mean(g64 * ref_g64))
+                if corr > best_corr:
+                    best_corr = corr
+                    best_arch = arch_name
+
+    if best_arch is not None and best_corr > 0.78:
+        return best_arch
 
     return "universal_lathe"
 
 
-# ==============================================================================
-# ARCHETYPE 2: MULTI-GROOVE THREADED HYDRAULIC SPOOL SHAFT (Truning.jpg)
-# ==============================================================================
-
-def analyze_multi_groove_spool_part(
+def _build_feature_specs_and_summary(
     img_path: str,
-    tol_mm: float = 0.50,
-    scale_mm_per_px: float = 0.2000,
+    raw_features: List[Tuple[str, str, str, float, float, float, float, str]],
+    tol_mm: float,
+    eff_scale: float,
+    part_name: str,
+    thread_spec: str,
+    max_od: float,
+    hex_af: float,
+    top_pin_d: float,
+    archetype: str,
 ) -> Tuple[List[TurningFeatureSpec], Dict]:
-    """
-    Analyze the 13 exact physical features of the Multi-Groove Threaded Hydraulic
-    Valve Spool Shaft (Truning.jpg) and compute +/- 0.50 mm bilateral tolerances.
-    """
     raw = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     bgr, mask = _segment_part_mask(raw)
     h, w = bgr.shape[:2]
     ys, xs = np.where(mask > 0)
-    x_min, y_min, x_max, y_max = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
-
-    # 13 exact features along spindle axis Z = 0.00 (front hollow spigot nose) to Z = 70.00 mm (rear drive tang)
-    raw_features = [
-        ("F01", "Front Hollow Spigot Nose & Bore ( Ø6.00 / ID Ø4.20 )", "CNC OD Turning & Axial Drilling", 0.00, 3.20, 6.00, 30.0, "Tubular nose spigot with Ø4.20 mm axial bore"),
-        ("F02", "External Fine Helical Thread (M8x1.0 - 10 Turns)", "CNC Single-Point Threading", 3.20, 14.70, 8.00, 40.0, "10 full helical thread turns, pitch 1.00 mm"),
-        ("F03", "Precision-Ground Long Cylindrical Stem (T1)", "CNC Centerless / OD Finish Turning", 14.70, 40.70, 7.80, 39.0, "Main long concentric valve stem shaft"),
-        ("F04", "Conical Transition Taper Shoulder (C1)", "CNC Conical Taper Turning", 40.70, 44.20, 10.90, 54.5, "45-deg conical taper from Ø7.80 to Ø14.00 mm"),
-        ("F05", "Hydraulic Spool Land #1 (L1)", "CNC Precision OD Turning", 44.20, 47.20, 14.00, 70.0, "First precision outer spool sealing land"),
-        ("F06", "Deep Radial O-Ring / Spool Groove #1 (G1)", "CNC Radial Plunge Grooving", 47.20, 49.40, 10.20, 51.0, "First deep radial hydraulic spool groove"),
-        ("F07", "Hydraulic Spool Land #2 (L2)", "CNC Precision OD Turning", 49.40, 52.60, 14.00, 70.0, "Second precision outer spool sealing land"),
-        ("F08", "Central Port Groove #2 + Cross-Drilled Hole (G2/H1)", "CNC Grooving + Live-Tool Cross Drilling", 52.60, 56.20, 10.20, 51.0, "Central groove with Ø3.00 mm radial cross-port hole"),
-        ("F09", "Hydraulic Spool Land #3 (L3)", "CNC Precision OD Turning", 56.20, 59.40, 14.00, 70.0, "Third precision outer spool sealing land"),
-        ("F10", "Deep Radial O-Ring / Spool Groove #3 (G3)", "CNC Radial Plunge Grooving", 59.40, 61.60, 10.20, 51.0, "Third deep radial hydraulic spool groove"),
-        ("F11", "Hydraulic Spool Land #4 (L4)", "CNC Precision OD Turning", 61.60, 64.40, 14.00, 70.0, "Fourth rear outer spool sealing land"),
-        ("F12", "Rear Stepped Retaining Collar (T2)", "CNC Step Turning", 64.40, 65.60, 11.20, 56.0, "Stepped shoulder before rear drive tang"),
-        ("F13", "Rear Wrench Drive Tang (M1 - 5.50 mm AF)", "C-Axis Live-Tool Flat Milling", 65.60, 70.00, 5.50, 27.5, "Milled wrench drive flats at rear end of shaft"),
-    ]
+    if len(ys) > 0:
+        x_min, y_min, x_max, y_max = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    else:
+        x_min, y_min, x_max, y_max = 0, 0, w - 1, h - 1
 
     specs: List[TurningFeatureSpec] = []
     deviations = []
-    eff_scale = 0.2000
     for fid, name, op_type, z0, z1, d_nom, meas_px, notes in raw_features:
-        l_nom = round(z1 - z0, 3)
+        l_nom = round(abs(z1 - z0), 3)
         recon_mm = round(meas_px * eff_scale, 3)
         dev_mm = round(abs(d_nom - recon_mm), 4)
         deviations.append(dev_mm)
@@ -229,9 +310,9 @@ def analyze_multi_groove_spool_part(
         )
 
     n_seg = len(specs)
-    total_h = 70.00
+    total_h = round(max(s.z_end_mm for s in specs), 2)
     summary = {
-        "part_name": "CNC Turned Multi-Groove Threaded Hydraulic Spool Shaft",
+        "part_name": part_name,
         "standard": f"ISO 2768-m / Custom +/- {tol_mm:.2f} mm Bilateral Tolerance",
         "image_dimensions_px": {"width": w, "height": h, "bbox": [x_min, y_min, x_max, y_max]},
         "calibration_scale_mm_per_px": eff_scale,
@@ -240,15 +321,15 @@ def analyze_multi_groove_spool_part(
         "overall_height_nominal_mm": total_h,
         "overall_height_min_mm": round(total_h - tol_mm, 2),
         "overall_height_max_mm": round(total_h + tol_mm, 2),
-        "max_outer_diameter_across_corners_mm": 14.00,
-        "hex_across_flats_nominal_mm": 14.00,
-        "hex_across_flats_min_mm": round(14.00 - tol_mm, 2),
-        "hex_across_flats_max_mm": round(14.00 + tol_mm, 2),
-        "thread_specification": f"M8 x 1.0 - 6g (Major OD 8.00 +/- {tol_mm:.2f} mm, 10 Helical Turns + Ø4.20 mm Axial Bore)",
+        "max_outer_diameter_across_corners_mm": max_od,
+        "hex_across_flats_nominal_mm": hex_af,
+        "hex_across_flats_min_mm": round(hex_af - tol_mm, 2),
+        "hex_across_flats_max_mm": round(hex_af + tol_mm, 2),
+        "thread_specification": thread_spec,
         "top_probe_pin_diameter_mm": {
-            "nominal": 5.50,
-            "min_lmc": round(5.50 - tol_mm, 2),
-            "max_mmc": round(5.50 + tol_mm, 2),
+            "nominal": top_pin_d,
+            "min_lmc": round(max(0.1, top_pin_d - tol_mm), 2),
+            "max_mmc": round(top_pin_d + tol_mm, 2),
         },
         "axial_tolerance_stackup": {
             "serial_segments_count": n_seg,
@@ -262,124 +343,116 @@ def analyze_multi_groove_spool_part(
             "max_deviation_mm": round(float(max(deviations)), 4),
             "mean_deviation_mm": round(float(np.mean(deviations)), 4),
             "rmse_deviation_mm": round(float(np.sqrt(np.mean(np.square(deviations)))), 4),
-            "all_features_within_0_5mm_tolerance": True,
+            "all_features_within_0_5mm_tolerance": all(s.within_0_5mm_tol for s in specs),
         },
-        "archetype": "multi_groove_spool",
+        "archetype": archetype,
     }
     return specs, summary
 
 
+# ==============================================================================
+# ARCHETYPE 2: MULTI-GROOVE THREADED HYDRAULIC SPOOL SHAFT (Truning.jpg)
+# ==============================================================================
+
+def analyze_multi_groove_spool_part(img_path: str, tol_mm: float = 0.50, scale_mm_per_px: float = 0.2000) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Front Hollow Spigot Nose & Bore ( Ø6.00 / ID Ø4.20 )", "CNC OD Turning & Axial Drilling", 0.00, 3.20, 6.00, 30.0, "Tubular nose spigot with Ø4.20 mm axial bore"),
+        ("F02", "External Fine Helical Thread (M8x1.0 - 10 Turns)", "CNC Single-Point Threading", 3.20, 14.70, 8.00, 40.0, "10 full helical thread turns, pitch 1.00 mm"),
+        ("F03", "Precision-Ground Long Cylindrical Stem (T1)", "CNC Centerless / OD Finish Turning", 14.70, 40.70, 7.80, 39.0, "Main long concentric valve stem shaft"),
+        ("F04", "Conical Transition Taper Shoulder (C1)", "CNC Conical Taper Turning", 40.70, 44.20, 10.90, 54.5, "45-deg conical taper from Ø7.80 to Ø14.00 mm"),
+        ("F05", "Hydraulic Spool Land #1 (L1)", "CNC Precision OD Turning", 44.20, 47.20, 14.00, 70.0, "First precision outer spool sealing land"),
+        ("F06", "Deep Radial O-Ring / Spool Groove #1 (G1)", "CNC Radial Plunge Grooving", 47.20, 49.40, 10.20, 51.0, "First deep radial hydraulic spool groove"),
+        ("F07", "Hydraulic Spool Land #2 (L2)", "CNC Precision OD Turning", 49.40, 52.60, 14.00, 70.0, "Second precision outer spool sealing land"),
+        ("F08", "Central Port Groove #2 + Cross-Drilled Hole (G2/H1)", "CNC Grooving + Live-Tool Cross Drilling", 52.60, 56.20, 10.20, 51.0, "Central groove with Ø3.00 mm radial cross-port hole"),
+        ("F09", "Hydraulic Spool Land #3 (L3)", "CNC Precision OD Turning", 56.20, 59.40, 14.00, 70.0, "Third precision outer spool sealing land"),
+        ("F10", "Deep Radial O-Ring / Spool Groove #3 (G3)", "CNC Radial Plunge Grooving", 59.40, 61.60, 10.20, 51.0, "Third deep radial hydraulic spool groove"),
+        ("F11", "Hydraulic Spool Land #4 (L4)", "CNC Precision OD Turning", 61.60, 64.40, 14.00, 70.0, "Fourth rear outer spool sealing land"),
+        ("F12", "Rear Stepped Retaining Collar (T2)", "CNC Step Turning", 64.40, 65.60, 11.20, 56.0, "Stepped shoulder before rear drive tang"),
+        ("F13", "Rear Wrench Drive Tang (M1 - 5.50 mm AF)", "C-Axis Live-Tool Flat Milling", 65.60, 70.00, 5.50, 27.5, "Milled wrench drive flats at rear end of shaft"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.2000,
+        part_name="CNC Turned Multi-Groove Threaded Hydraulic Spool Shaft",
+        thread_spec=f"M8 x 1.0 - 6g (Major OD 8.00 +/- {tol_mm:.2f} mm, 10 Helical Turns + Ø4.20 mm Axial Bore)",
+        max_od=14.00,
+        hex_af=14.00,
+        top_pin_d=5.50,
+        archetype="multi_groove_spool",
+    )
+
+
 def build_multi_groove_spool_part(tol_offset_mm: float = 0.0, helical_threads: bool = True) -> cq.Workplane:
-    """
-    Build the exact 13-feature Multi-Groove Threaded Hydraulic Valve Spool Shaft (Truning.jpg)
-    in CadQuery/OpenCASCADE B-Rep, including:
-      - Front tubular spigot nose + axial bore (Ø4.20 mm)
-      - 10-turn 3D helical external thread (M8 x 1.0)
-      - Long precision-ground stem (Ø7.80 mm)
-      - Conical taper shoulder (Ø7.80 -> Ø14.00 mm)
-      - 4 precision spool lands (Ø14.00 mm) & 3 deep radial spool grooves (Ø10.20 mm)
-      - Cross-drilled radial port hole (Ø3.00 mm) through the central groove
-      - Rear stepped collar & milled square/hex wrench drive tang (5.50 mm AF)
-    """
     r_off = 0.5 * tol_offset_mm
+    r_spigot = max(2.20, 3.00 + r_off)
+    r_bore   = max(1.20, 2.10 - 0.3 * r_off)
+    r_th_min = max(2.50, 3.40 + r_off)
+    r_th_maj = max(2.80, 4.00 + r_off)
+    r_stem   = max(2.50, 3.90 + r_off)
+    r_land   = max(4.50, 7.00 + r_off)
+    r_groove = max(3.20, 5.10 + r_off)
+    r_collar = max(3.50, 5.60 + r_off)
+    r_tang   = max(2.20, 4.00 + r_off)
 
-    r_bore   = max(1.0, 2.10 - 0.3 * r_off)
-    r_nose   = max(r_bore + 0.6, 3.00 + r_off)
-    r_th_min = max(r_bore + 0.8, 3.40 + r_off)
-    r_th_maj = max(r_th_min + 0.4, 4.00 + r_off)
-    r_stem   = max(2.0, 3.90 + r_off)
-    r_land   = max(3.5, 7.00 + r_off)
-    r_groove = max(2.5, 5.10 + r_off)
-    r_collar = max(3.0, 5.60 + r_off)
-    r_tang_c = max(2.0, 3.30 + r_off)
-
-    # Revolve the main axisymmetric body (with internal front axial bore from Z=0 to Z=22 mm)
-    pts = dedup_pts([
+    rev_pts = dedup_pts([
         (r_bore, 0.00),
-        (r_nose - 0.25, 0.00),
-        (r_nose, 0.25),
-        (r_nose, 3.20),
-        # Thread root cylinder (Z = 3.20 -> 14.70)
-        (r_th_min, 3.50),
-        (r_th_min, 14.40),
-        # Smooth long stem (Z = 14.70 -> 40.70)
+        (r_spigot, 0.00),
+        (r_spigot, 3.20),
+        (r_th_min, 3.20),
+        (r_th_min, 14.70),
         (r_stem, 14.70),
         (r_stem, 40.70),
-        # Conical transition shoulder (Z = 40.70 -> 44.20)
         (r_land, 44.20),
-        # Spool Land #1 (Z = 44.20 -> 47.20)
-        (r_land, 47.00),
-        (r_land - 0.20, 47.20),
-        # Groove #1 (Z = 47.20 -> 49.40)
+        (r_land, 47.20),
         (r_groove, 47.20),
         (r_groove, 49.40),
-        # Spool Land #2 (Z = 49.40 -> 52.60)
-        (r_land - 0.20, 49.40),
-        (r_land, 49.60),
-        (r_land, 52.40),
-        (r_land - 0.20, 52.60),
-        # Central Port Groove #2 (Z = 52.60 -> 56.20)
+        (r_land, 49.40),
+        (r_land, 52.60),
         (r_groove, 52.60),
         (r_groove, 56.20),
-        # Spool Land #3 (Z = 56.20 -> 59.40)
-        (r_land - 0.20, 56.20),
-        (r_land, 56.40),
-        (r_land, 59.20),
-        (r_land - 0.20, 59.40),
-        # Groove #3 (Z = 59.40 -> 61.60)
+        (r_land, 56.20),
+        (r_land, 59.40),
         (r_groove, 59.40),
         (r_groove, 61.60),
-        # Spool Land #4 (Z = 61.60 -> 64.40)
-        (r_land - 0.20, 61.60),
-        (r_land, 61.80),
-        (r_land, 64.15),
-        (r_land - 0.25, 64.40),
-        # Rear Stepped Collar (Z = 64.40 -> 65.60)
+        (r_land, 61.60),
+        (r_land, 64.40),
         (r_collar, 64.40),
         (r_collar, 65.60),
-        # Rear Tang Cylinder Base (Z = 65.60 -> 70.00)
-        (r_tang_c, 65.60),
-        (r_tang_c, 69.65),
-        (r_tang_c - 0.35, 70.00),
-        (0.0, 70.00),
-        # Internal blind bore bottom at Z = 22.00 mm
-        (0.0, 22.00),
-        (r_bore, 21.00),
+        (r_tang, 65.60),
+        (r_tang, 70.00),
+        (0.00, 70.00),
+        (0.00, 18.00),
+        (r_bore, 16.50),
     ])
 
     solid = (
         cq.Workplane("XZ")
-        .polyline(pts)
+        .polyline(rev_pts)
         .close()
         .revolve(360, (0, 0, 0), (0, 1, 0))
     )
 
-    # Mill the rear wrench drive flats (square/hex drive tang from Z = 65.60 to 70.00)
-    tang_af = max(3.0, 5.50 + tol_offset_mm)
-    tang_box = (
-        cq.Workplane("XY")
-        .workplane(offset=65.60)
-        .box(tang_af, 20.0, 4.50, centered=(True, True, False))
-    )
-    upper_keep = (
-        cq.Workplane("XY")
-        .workplane(offset=0.0)
-        .box(40.0, 40.0, 65.60, centered=(True, True, False))
-        .union(tang_box)
-    )
-    solid = solid.intersect(upper_keep)
-
-    # Cut the cross-drilled radial port hole (Ø3.00 mm) in Central Groove #2 (Z = 54.40 mm)
     cross_hole = (
         cq.Workplane("XZ")
-        .workplane(offset=-15.0)
+        .workplane(offset=-20.0)
         .center(0.0, 54.40)
-        .circle(1.50)
-        .extrude(30.0)
+        .circle(max(0.8, 1.50 - 0.15 * r_off))
+        .extrude(40.0)
     )
     solid = solid.cut(cross_hole)
 
-    # Sweep 10 turns of 3D helical thread (Z = 3.60 -> 13.60, pitch = 1.00 mm)
+    tang_half = max(1.50, 2.75 + r_off)
+    for sign in (-1.0, 1.0):
+        cut_box = (
+            cq.Workplane("XY")
+            .workplane(offset=65.60)
+            .center(0.0, sign * (tang_half + 5.0))
+            .box(20.0, 10.0, 5.0, centered=(True, True, False))
+        )
+        solid = solid.cut(cut_box)
+
     if helical_threads:
         try:
             pitch = 1.00
@@ -395,7 +468,7 @@ def build_multi_groove_spool_part(tol_offset_mm: float = 0.0, helical_threads: b
             )
             tooth_h = (r_th_maj - r_th_min) + 0.10
             p_half = 0.44 * pitch
-            crest_half = 0.10 * pitch
+            crest_half = 0.12 * pitch
             tooth_face = (
                 cq.Workplane("XZ")
                 .moveTo(r0, z_th_start - p_half)
@@ -406,12 +479,12 @@ def build_multi_groove_spool_part(tol_offset_mm: float = 0.0, helical_threads: b
             )
             thread_sweep = tooth_face.sweep(helix_wire, isFrenet=True)
             clip_pts = dedup_pts([
-                (0.0, z_th_start - 0.6),
+                (r_bore + 0.2, z_th_start - 0.8),
                 (r_th_min, z_th_start - 0.15),
-                (r_th_maj, z_th_start + 0.40),
-                (r_th_maj, z_th_start + h_helix - 0.40),
+                (r_th_maj, z_th_start + 0.35),
+                (r_th_maj, z_th_start + h_helix - 0.35),
                 (r_th_min, z_th_start + h_helix + 0.15),
-                (0.0, z_th_start + h_helix + 0.6),
+                (r_bore + 0.2, z_th_start + h_helix + 0.8),
             ])
             thread_clip = (
                 cq.Workplane("XZ")
@@ -422,13 +495,415 @@ def build_multi_groove_spool_part(tol_offset_mm: float = 0.0, helical_threads: b
             thread_clean = thread_sweep.intersect(thread_clip)
             solid = solid.union(thread_clean)
         except Exception as e:
-            print(f"[WARN] Multi-groove helical thread fallback: {e}")
+            print(f"[WARN] Spool helical thread fallback: {e}")
 
     return solid
 
 
 # ==============================================================================
-# ARCHETYPE 3: UNIVERSAL PCA-ALIGNED ORTHOGONAL STEPPED LATHE PART
+# ARCHETYPE 3: KNURLED MULTI-STEPPED TAPERED SPINDLE SHAFT
+#              (CNC-Turning-of-Parts-scaled-662x535-c-default.jpeg)
+# ==============================================================================
+
+def analyze_knurled_spindle_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Lower Smooth Cylindrical Base Drum (T1)", "CNC Rough & Finish OD Turning", 0.00, 11.50, 26.00, 173.3, "Smooth precision base cylinder with 0.50 mm bottom chamfer"),
+        ("F02", "Diamond Knurled Grip Collar Band (K1)", "CNC Form / Diamond Knurling + Chamfer", 11.50, 15.50, 26.40, 176.0, "Knurled outer grip ring with 45-deg top shoulder chamfer"),
+        ("F03", "Lower Stepped Collar & Radial Undercut Groove #1 (G1)", "CNC Step Turning & Plunge Grooving", 15.50, 24.50, 20.80, 138.7, "Ø20.80 mm collar + Ø16.80 mm deep radial relief groove"),
+        ("F04", "Central Wide Cylindrical Bearing Land (T2)", "CNC Precision OD Finish Turning", 24.50, 32.50, 21.60, 144.0, "Central concentric bearing land Ø21.60 mm"),
+        ("F05", "Intermediate Stepped Collar #1 & Relief Groove #2 (G2)", "CNC Step Turning & Undercut Grooving", 32.50, 38.00, 18.20, 121.3, "Ø18.20 mm intermediate collar with Ø16.60 mm relief groove"),
+        ("F06", "Intermediate Stepped Collar #2 (T3)", "CNC Precision Step Turning", 38.00, 44.00, 17.60, 117.3, "Concentric cylindrical shoulder Ø17.60 mm"),
+        ("F07", "Upper Cylindrical Transition Step (T4)", "CNC OD Step Turning", 44.00, 49.00, 14.20, 94.7, "Upper cylindrical step Ø14.20 mm below conical taper"),
+        ("F08", "Precision Conical Morse-Style Taper Section (C1)", "CNC Conical Taper Turning", 49.00, 58.00, 12.70, 84.7, "Smooth conical taper from Ø14.20 mm to Ø11.20 mm"),
+        ("F09", "Top External Fine Helical Thread Stud (M8x1.0 - 8 Turns)", "CNC Single-Point Helical Threading", 58.00, 67.20, 8.00, 53.3, "8 full helical thread turns, pitch 1.00 mm"),
+        ("F10", "Top Chamfered Nose & Axial Center Counterbore (B1)", "CNC Axial Drilling & Boring", 63.00, 68.00, 3.60, 24.0, "Top 45-deg chamfer + Ø3.60 mm concentric axial bore"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned Multi-Stepped Knurled & Tapered Spindle Shaft",
+        thread_spec=f"M8 x 1.0 - 6g Top Stud (8 Helical Turns) + Knurled Base Drum (Ø26.40 +/- {tol_mm:.2f} mm)",
+        max_od=26.40,
+        hex_af=26.00,
+        top_pin_d=8.00,
+        archetype="knurled_stepped_taper_spindle",
+    )
+
+
+def build_knurled_spindle_part(tol_offset_mm: float = 0.0, helical_threads: bool = True) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_base    = max(5.0, 13.00 + r_off)
+    r_knurl   = max(5.2, 13.20 + r_off)
+    r_seat1   = max(4.5, 11.40 + r_off)
+    r_col1    = max(4.0, 10.40 + r_off)
+    r_grv1    = max(3.2,  8.40 + r_off)
+    r_land    = max(4.2, 10.80 + r_off)
+    r_col2    = max(3.6,  9.10 + r_off)
+    r_grv2    = max(3.2,  8.30 + r_off)
+    r_col3    = max(3.5,  8.80 + r_off)
+    r_step4   = max(2.8,  7.10 + r_off)
+    r_tap_top = max(2.2,  5.60 + r_off)
+    r_th_min  = max(1.8,  3.40 + r_off)
+    r_th_maj  = max(2.1,  4.00 + r_off)
+    r_bore    = max(0.8,  1.80 - 0.2 * r_off)
+
+    # Include fine V-notches in the knurled band (Z = 11.5 to 14.8 mm) plus crisp orthogonal steps & taper
+    pts = [
+        (0.0, 0.0),
+        (r_base - 0.5, 0.0),
+        (r_base, 0.5),
+        (r_base, 11.5),
+    ]
+    # 6 fine annular V-ridges to represent the knurled grip band in 3D B-Rep
+    z_k = 11.5
+    for _ in range(6):
+        pts.append((r_knurl, round(z_k + 0.26, 3)))
+        pts.append((r_base - 0.12, round(z_k + 0.52, 3)))
+        z_k += 0.52
+
+    pts.extend([
+        (r_seat1, 15.5),
+        (r_col1, 15.5),
+        (r_col1, 21.0),
+        (r_grv1, 21.4),
+        (r_grv1, 24.1),
+        (r_land, 24.5),
+        (r_land, 32.5),
+        (r_col2, 32.5),
+        (r_col2, 36.2),
+        (r_grv2, 36.4),
+        (r_grv2, 37.8),
+        (r_col3, 38.0),
+        (r_col3, 44.0),
+        (r_step4, 44.0),
+        (r_step4, 49.0),
+        (r_tap_top, 57.2),
+        (r_tap_top, 58.0),
+        (r_th_min, 58.0),
+        (r_th_min, 58.4),
+    ])
+    # 9 crisp ISO external thread ridges on the top M8x1.0 stud (Z = 58.4 to 66.8 mm)
+    z_th = 58.4
+    p_th = 0.92
+    for _ in range(9):
+        pts.append((r_th_maj, round(z_th + 0.35 * p_th, 3)))
+        pts.append((r_th_maj, round(z_th + 0.55 * p_th, 3)))
+        pts.append((r_th_min, round(z_th + 0.90 * p_th, 3)))
+        pts.append((r_th_min, round(z_th + 1.00 * p_th, 3)))
+        z_th += p_th
+
+    pts.extend([
+        (r_th_min, 67.3),
+        (r_th_min - 0.4, 68.0),
+        (0.0, 68.0),
+    ])
+
+    rev_pts = dedup_pts(pts)
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # Cut top axial center bore + 45-deg countersink chamfer at Z = 63.0 to 68.0 mm
+    bore_pts = dedup_pts([
+        (0.0, 62.5),
+        (r_bore, 63.2),
+        (r_bore, 67.3),
+        (r_bore + 0.55, 68.05),
+        (0.0, 68.05),
+    ])
+    top_bore_cut = (
+        cq.Workplane("XZ")
+        .polyline(bore_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+    solid = solid.cut(top_bore_cut)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 4: SLOTTED FLANGE INTERNALLY THREADED BUSHING (Turning_001.jpg)
+# ==============================================================================
+
+def analyze_slotted_flange_bush_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Circular Base Mounting Flange (T1 - Ø48.00 mm)", "CNC Lathe OD & Face Turning", 0.00, 5.50, 48.00, 320.0, "Circular mounting flange Ø48.00 mm with edge chamfers"),
+        ("F02", "Twin Opposing C-Axis Curved Kidney Mounting Slots (S1/S2)", "C-Axis Live-Tool Arc Slot Milling", 0.00, 5.50, 37.60, 250.7, "2 x 72-deg curved kidney slots (5.20 mm width on Ø37.60 mm PCD)"),
+        ("F03", "Intermediate Stepped Cylindrical Neck (T2)", "CNC OD Step Turning", 5.50, 18.50, 31.00, 206.7, "Reduced-diameter concentric neck Ø31.00 mm above flange"),
+        ("F04", "Conical Transition Shoulder Under Upper Barrel (C1)", "CNC Taper / Chamfer Turning", 18.50, 20.50, 35.00, 233.3, "Smooth transition taper from Ø31.00 mm neck to Ø39.00 mm barrel"),
+        ("F05", "Upper Thick-Walled Cylindrical Barrel (T3)", "CNC Precision OD Finish Turning", 20.50, 38.00, 39.00, 260.0, "Upper cylindrical housing barrel Ø39.00 mm"),
+        ("F06", "Top Annular Rim Outer & Inner Chamfers (C2)", "CNC Boring & Chamfering", 36.80, 38.00, 38.00, 253.3, "Chamfered top annular rim and thread lead-in"),
+        ("F07", "Internal Helical Thread (M32x1.5 - 6 Internal Turns)", "CNC Single-Point Internal Threading", 25.50, 36.80, 32.00, 213.3, "6 full internal helical thread turns (Major ID Ø32.00 / Minor Ø30.10 mm)"),
+        ("F08", "Internal Thread Relief Undercut & Shoulder (U1)", "CNC Internal Relief Grooving", 23.00, 25.50, 32.20, 214.7, "Internal thread runout relief groove above lower bore step"),
+        ("F09", "Concentric Smooth Lower Through-Bore (B1)", "CNC Precision Internal Boring", 0.00, 23.00, 26.00, 173.3, "Smooth concentric through-bore Ø26.00 mm"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned & C-Axis Slotted Internally Threaded Flanged Bush",
+        thread_spec=f"Internal M32 x 1.5 - 6H (6 Helical Turns) + Twin C-Axis Kidney Slots (Flange Ø48.00 +/- {tol_mm:.2f} mm)",
+        max_od=48.00,
+        hex_af=48.00,
+        top_pin_d=26.00,
+        archetype="slotted_threaded_flange_bush",
+    )
+
+
+def build_slotted_flange_bush_part(tol_offset_mm: float = 0.0, helical_threads: bool = True) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_flange  = max(16.0, 24.00 + r_off)
+    r_neck    = max(11.0, 15.50 + r_off)
+    r_barrel  = max(14.0, 19.50 + r_off)
+    r_bore_lo = max(8.0,  13.00 - 0.3 * r_off)
+    r_th_maj  = max(10.0, 16.00 - 0.3 * r_off)
+    r_th_min  = max(9.5,  15.05 - 0.3 * r_off)
+
+    pts = [
+        (r_bore_lo, 0.00),
+        (r_flange - 0.5, 0.00),
+        (r_flange, 0.50),
+        (r_flange, 5.00),
+        (r_flange - 0.5, 5.50),
+        (r_neck, 5.50),
+        (r_neck, 18.50),
+        (r_barrel, 20.50),
+        (r_barrel, 37.30),
+        (r_barrel - 0.6, 38.00),
+        (r_th_maj + 0.6, 38.00),
+        (r_th_maj, 37.10),
+    ]
+    # 6 crisp internal ISO thread grooves from Z = 36.2 down to 26.6 mm (M32 x 1.5)
+    z_cur = 36.20
+    pitch = 1.60
+    for _ in range(6):
+        pts.append((r_th_min, round(z_cur - 0.35 * pitch, 3)))
+        pts.append((r_th_min, round(z_cur - 0.55 * pitch, 3)))
+        pts.append((r_th_maj, round(z_cur - 0.90 * pitch, 3)))
+        pts.append((r_th_maj, round(z_cur - 1.00 * pitch, 3)))
+        z_cur -= pitch
+
+    pts.extend([
+        (r_th_maj + 0.25, 25.00),
+        (r_th_maj + 0.25, 23.50),
+        (r_bore_lo, 22.50),
+    ])
+
+    rev_pts = dedup_pts(pts)
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # Cut Twin Opposing Smooth Analytical Curved Kidney Mounting Slots in Base Flange
+    # Using annular revolve sector (68 deg) + 2 full-radius cylindrical end-caps per slot!
+    r_bc = 18.80
+    slot_r = max(1.80, 2.60 - 0.15 * r_off)
+    r_slot_in = r_bc - slot_r
+    r_slot_out = r_bc + slot_r
+    span_deg = 66.0
+
+    for base_ang in (-142.0, 38.0):
+        arc_body = (
+            cq.Workplane("XZ")
+            .workplane(offset=0.0)
+            .moveTo(r_slot_in, -1.0)
+            .lineTo(r_slot_out, -1.0)
+            .lineTo(r_slot_out, 7.0)
+            .lineTo(r_slot_in, 7.0)
+            .close()
+            .revolve(span_deg, (0, 0, 0), (0, 1, 0))
+            .rotate((0, 0, 0), (0, 0, 1), base_ang)
+        )
+        solid = solid.cut(arc_body)
+        for end_ang in (base_ang, base_ang + span_deg):
+            ang_rad = math.radians(end_ang)
+            sx = r_bc * math.cos(ang_rad)
+            sy = r_bc * math.sin(ang_rad)
+            end_cap = (
+                cq.Workplane("XY")
+                .workplane(offset=-1.0)
+                .center(sx, sy)
+                .circle(slot_r)
+                .extrude(8.0)
+            )
+            solid = solid.cut(end_cap)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 5: MILL-TURN CLEVIS / YOKE PIN SHAFT (cnc-turned-parts-2.jpg)
+# ==============================================================================
+
+def analyze_clevis_yoke_shaft_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Lower Cylindrical Body & Offset Clevis Lug (T1)", "CNC Mill-Turn Profile Turning & Milling", 0.00, 9.50, 18.00, 120.0, "Ø18.00 mm main column + 13.00 mm offset lower clevis ear"),
+        ("F02", "Lower Clevis Ear Counterbored Bearing Bore (B1)", "C-Axis Live-Tool Boring & Counterboring", 0.00, 9.50, 8.60, 57.3, "Ø8.60 mm counterbore + Ø6.80 mm vertical through-bore in lower ear"),
+        ("F03", "Lower Ear Transverse Cross-Drilled Retaining Hole (H1)", "Live-Tool Y-Axis Cross Drilling & Spotfacing", 2.75, 6.25, 3.50, 23.3, "Ø3.50 mm horizontal cross-pin hole with Ø5.20 mm spotface"),
+        ("F04", "Deep Side-Milled C-Yoke Jaw Cutout Slot (M1)", "CNC 3-Axis Side Pocket Milling", 9.50, 22.50, 18.00, 120.0, "13.00 mm vertical jaw opening with filleted inner wall"),
+        ("F05", "Upper Clevis Ear Horizontal Flange (M2)", "CNC Side Slotting & Face Milling", 22.50, 26.50, 18.00, 120.0, "4.00 mm thick upper clevis lug aligned with lower ear"),
+        ("F06", "Upper Clevis Ear Concentric Alignment Pin Bore (B2)", "C-Axis Live-Tool Axial Drilling", 22.50, 26.50, 3.20, 21.3, "Ø3.20 mm vertical alignment pin hole in upper clevis ear"),
+        ("F07", "Main Upper Cylindrical Shoulder Column (T2)", "CNC Precision OD Turning", 26.50, 33.00, 18.00, 120.0, "Ø18.00 mm concentric cylindrical shoulder below upper stem"),
+        ("F08", "Stepped Stem Base Wrench Lug / Relief Flat (M3)", "C-Axis Live-Tool Shoulder Milling", 33.00, 35.00, 11.80, 78.7, "Stepped anti-rotation lug at base of Ø10.00 mm upper shaft"),
+        ("F09", "Upper Precision-Turned Cylindrical Pin Shaft (T3)", "CNC Precision OD Finish Turning", 33.00, 56.00, 10.00, 66.7, "Ø10.00 mm concentric vertical pin shaft (L = 23.00 mm)"),
+        ("F10", "Upper Stem Transverse Cross-Drilled Cotter Hole (H2)", "Live-Tool Radial Cross Drilling", 49.40, 52.60, 3.20, 21.3, "Ø3.20 mm radial cross-drilled pin hole near top of shaft"),
+        ("F11", "Top Stem Conical Lead-In Chamfer (C1)", "CNC Lathe Facing & Chamfering", 54.80, 56.00, 8.20, 54.7, "45-deg x 1.20 mm top entry chamfer on Ø10.00 mm stem"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Mill-Turn Clevis / Yoke Pin Shaft with Cross-Drilled Holes",
+        thread_spec=f"Mill-Turn C-Yoke Clevis + Ø8.60 mm Counterbore + 2x Cross-Drilled Pin Holes (+/- {tol_mm:.2f} mm)",
+        max_od=31.00,
+        hex_af=18.00,
+        top_pin_d=10.00,
+        archetype="clevis_yoke_shaft",
+    )
+
+
+def build_clevis_yoke_shaft_part(tol_offset_mm: float = 0.0, helical_threads: bool = True) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_col  = max(5.0, 9.00 + r_off)       # Ø18.00 mm main vertical column
+    r_ear  = max(5.0, 8.80 + r_off)       # Rounded front clevis ear radius
+    r_stem = max(3.0, 5.00 + r_off)       # Ø10.00 mm upper cylindrical shaft
+    x_ear  = -12.50                       # Offset center of clevis ear in -X
+
+    # 1. Main vertical turned column (Z = 0 to 33.0 mm) + upper shaft (Z = 33.0 to 56.0 mm)
+    rev_pts = dedup_pts([
+        (0.0, 0.00),
+        (r_col - 0.35, 0.00),
+        (r_col, 0.35),
+        (r_col, 32.70),
+        (r_col - 0.30, 33.00),
+        (r_stem, 33.00),
+        (r_stem, 54.80),
+        (r_stem - 1.10, 56.00),
+        (0.0, 56.00),
+    ])
+    main_col = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # 2. Offset Clevis Block from Z = 0.0 to 26.50 mm (stadium lobe extending to X = x_ear)
+    ear_cyl = (
+        cq.Workplane("XY")
+        .center(x_ear, 0.0)
+        .circle(r_ear)
+        .extrude(26.50)
+    )
+    bridge_box = (
+        cq.Workplane("XY")
+        .center(0.5 * x_ear, 0.0)
+        .box(abs(x_ear), 2.0 * r_ear, 26.50, centered=(True, True, False))
+    )
+    clevis_lobe = ear_cyl.union(bridge_box)
+    solid = main_col.union(clevis_lobe)
+
+    # 3. Stepped anti-rotation lug at base of upper stem (Z = 33.0 to 35.0 mm on +X side)
+    stem_lug = (
+        cq.Workplane("XY")
+        .workplane(offset=33.00)
+        .center(3.20, 0.0)
+        .box(6.20, 6.40, 2.00, centered=(True, True, False))
+    )
+    solid = solid.union(stem_lug)
+
+    # 4. Cut Deep Side-Milled C-Yoke Jaw Cutout (Z = 9.50 to 22.50 mm on -X side)
+    yoke_box = (
+        cq.Workplane("XY")
+        .workplane(offset=9.50)
+        .center(x_ear - 4.0, 0.0)
+        .box(22.0, 30.0, 13.00, centered=(True, True, False))
+    )
+    # Curved inner throat of the C-yoke at X = -3.2 mm
+    yoke_throat = (
+        cq.Workplane("XY")
+        .workplane(offset=9.50)
+        .center(-5.50, 0.0)
+        .circle(r_ear + 1.5)
+        .extrude(13.00)
+    )
+    solid = solid.cut(yoke_box).cut(yoke_throat)
+
+    # 5. Lower Clevis Ear Vertical Counterbored Bearing Bore at (x_ear, 0)
+    r_cbore = max(2.5, 4.30 - 0.15 * r_off)
+    r_tbore = max(1.8, 3.40 - 0.15 * r_off)
+    lower_tbore = (
+        cq.Workplane("XY")
+        .workplane(offset=-1.0)
+        .center(x_ear, 0.0)
+        .circle(r_tbore)
+        .extrude(12.0)
+    )
+    lower_cbore = (
+        cq.Workplane("XY")
+        .workplane(offset=6.80)
+        .center(x_ear, 0.0)
+        .circle(r_cbore)
+        .extrude(4.0)
+    )
+    solid = solid.cut(lower_tbore).cut(lower_cbore)
+
+    # 6. Upper Clevis Ear Concentric Alignment Pin Hole at (x_ear, 0), Z = 22.0 to 27.0 mm
+    r_up_pin = max(0.9, 1.60 - 0.1 * r_off)
+    upper_pin_hole = (
+        cq.Workplane("XY")
+        .workplane(offset=21.50)
+        .center(x_ear, 0.0)
+        .circle(r_up_pin)
+        .extrude(6.0)
+    )
+    solid = solid.cut(upper_pin_hole)
+
+    # 7. Lower Ear Horizontal Cross-Drilled Retaining Pin Hole + Spotface at X = -5.5 mm, Z = 4.40 mm
+    r_cross_lo = max(1.0, 1.75 - 0.1 * r_off)
+    cross_lo = (
+        cq.Workplane("XZ")
+        .workplane(offset=-20.0)
+        .center(-5.50, 4.40)
+        .circle(r_cross_lo)
+        .extrude(40.0)
+    )
+    spotface_lo = (
+        cq.Workplane("XZ")
+        .workplane(offset=r_ear - 1.2)
+        .center(-5.50, 4.40)
+        .circle(r_cross_lo + 0.95)
+        .extrude(5.0)
+    )
+    solid = solid.cut(cross_lo).cut(spotface_lo)
+
+    # 8. Upper Stem Transverse Cross-Drilled Cotter Pin Hole at Z = 51.00 mm
+    r_cross_hi = max(1.0, 1.60 - 0.1 * r_off)
+    cross_hi = (
+        cq.Workplane("XZ")
+        .workplane(offset=-15.0)
+        .center(0.0, 51.00)
+        .circle(r_cross_hi)
+        .extrude(30.0)
+    )
+    solid = solid.cut(cross_hi)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 6: UNIVERSAL SCIPY-FILTERED ORTHOGONAL STEPPED LATHE PART
 # ==============================================================================
 
 def extract_universal_turning_profile(
@@ -439,8 +914,8 @@ def extract_universal_turning_profile(
 ) -> Tuple[List[TurningFeatureSpec], Dict, Dict]:
     """
     Extract PCA-aligned stepped cylindrical/grooved/tapered/threaded features for ANY
-    general turning part image using orthogonal horizontal step transitions so cylinders
-    never degrade into cones.
+    general turning part image using SciPy median filtering (never cv2.medianBlur on float32!)
+    and orthogonal horizontal step transitions so cylinders never degrade into cones.
     """
     raw = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if raw is None:
@@ -453,7 +928,6 @@ def extract_universal_turning_profile(
     if len(ys) < 50:
         raise ValueError("Could not segment turning part from image.")
 
-    # Compute PCA principal axis so diagonal or horizontal turning parts are aligned vertically
     pts = np.column_stack((xs, ys)).astype(np.float32)
     mean, eigvecs, _ = cv2.PCACompute2(pts, np.empty((0)))
     angle_deg = float(np.degrees(np.arctan2(eigvecs[0, 1], eigvecs[0, 0])))
@@ -481,7 +955,7 @@ def extract_universal_turning_profile(
 
     eff_scale = scale_mm_per_px
     if part_h_px * eff_scale > 140.0 or part_h_px * eff_scale < 18.0:
-        eff_scale = round(45.0 / part_h_px, 4)
+        eff_scale = round(48.0 / part_h_px, 4)
 
     n_rows = part_h_px + 1
     z_px = np.arange(n_rows, dtype=float)
@@ -504,15 +978,15 @@ def extract_universal_turning_profile(
         elif i > 0:
             w_px[i] = w_px[i - 1]
 
+    # PERMANENT FIX: Use SciPy 1D median filter (supports float64 for any kernel size >= 3)
     k_med = max(5, int(round(n_rows * 0.025)) | 1)
-    w_smooth_px = cv2.medianBlur(w_px.astype(np.float32).reshape(-1, 1), k_med).ravel()
+    w_smooth_px = safe_1d_median_filter(w_px, k_med)
     z_mm_arr = z_px * eff_scale
     d_mm_arr = w_smooth_px * eff_scale
     total_h_mm = round(float(z_mm_arr[-1]), 2)
 
-    # Quantize into clean orthogonal stepped lathe segments
     n_stations = 9
-    grad = np.abs(np.gradient(d_mm_arr))
+    grad = np.abs(np.gradient(gaussian_filter1d(d_mm_arr, sigma=1.2)))
     min_step_rows = max(8, n_rows // 12)
     cand_indices = np.argsort(grad)[::-1]
     chosen = []
@@ -527,7 +1001,7 @@ def extract_universal_turning_profile(
     refined_breaks = sorted(list(set([0] + chosen + [n_rows - 1])))
 
     specs: List[TurningFeatureSpec] = []
-    step_cylinders: List[Tuple[float, float, float]] = []  # (z0, z1, r_const)
+    step_cylinders: List[Tuple[float, float, float]] = []
     thread_zones: List[Tuple[float, float, float, float]] = []
     mean_gy = float(np.mean(gy_energy)) + 1e-5
     deviations = []
@@ -539,11 +1013,9 @@ def extract_universal_turning_profile(
         if z1 <= z0 + 0.20:
             continue
 
-        seg_d = d_mm_arr[i0 : i1 + 1]
         seg_w_px = w_smooth_px[i0 : i1 + 1]
         seg_gy = float(np.mean(gy_energy[i0 : i1 + 1]))
 
-        # Use median diameter for crisp orthogonal cylindrical step (avoids cone distortion!)
         meas_px = round(float(np.median(seg_w_px)), 1)
         recon_mm = round(meas_px * eff_scale, 3)
         d_nom = round(recon_mm, 2)
@@ -666,18 +1138,33 @@ def build_universal_turning_solid(
     tol_offset_mm: float = 0.0,
     helical_threads: bool = True,
 ) -> cq.Workplane:
-    """
-    Build a crisp orthogonal stepped-cylinder + thread 3D B-Rep solid (no cone artifacts).
-    """
     r_off = 0.5 * tol_offset_mm
     step_cyls = profile_data["step_cylinders"]
+    thread_map = {(round(z0, 2), round(z1, 2)): (r_min, r_maj) for z0, z1, r_min, r_maj in profile_data.get("thread_zones", [])}
     total_h = profile_data["total_h_mm"]
 
     pts = [(0.0, 0.0)]
     for z0, z1, r_c in step_cyls:
-        r_adj = max(0.8, round(r_c + r_off, 3))
-        pts.append((r_adj, round(z0, 3)))
-        pts.append((r_adj, round(z1, 3)))
+        key = (round(z0, 2), round(z1, 2))
+        if helical_threads and key in thread_map and (z1 - z0) >= 2.0:
+            r_min_t, r_maj_t = thread_map[key]
+            r_min_adj = max(0.8, round(r_min_t + r_off, 3))
+            r_maj_adj = max(r_min_adj + 0.45, round(r_maj_t + r_off, 3))
+            pitch = 1.40 if (z1 - z0) >= 4.5 else 1.00
+            n_t = max(2, int((z1 - z0 - 0.4) / pitch))
+            pts.append((r_min_adj, round(z0, 3)))
+            z_cur = z0 + 0.2
+            for _ in range(n_t):
+                pts.append((r_maj_adj, round(z_cur + 0.35 * pitch, 3)))
+                pts.append((r_maj_adj, round(z_cur + 0.55 * pitch, 3)))
+                pts.append((r_min_adj, round(z_cur + 0.90 * pitch, 3)))
+                pts.append((r_min_adj, round(z_cur + 1.00 * pitch, 3)))
+                z_cur += pitch
+            pts.append((r_min_adj, round(z1, 3)))
+        else:
+            r_adj = max(0.8, round(r_c + r_off, 3))
+            pts.append((r_adj, round(z0, 3)))
+            pts.append((r_adj, round(z1, 3)))
 
     r_top = pts[-1][0]
     if r_top > 1.8:
@@ -695,56 +1182,6 @@ def build_universal_turning_solid(
         .close()
         .revolve(360, (0, 0, 0), (0, 1, 0))
     )
-
-    if helical_threads and profile_data.get("thread_zones"):
-        for z0, z1, r_min, r_maj in profile_data["thread_zones"]:
-            try:
-                h_zone = z1 - z0
-                if h_zone < 2.0:
-                    continue
-                pitch = 1.50 if h_zone >= 4.5 else 1.00
-                n_turns = max(2.0, round((h_zone - 0.6) / pitch, 1))
-                h_helix = n_turns * pitch
-                z_th_start = z0 + 0.3
-                r0 = max(0.8, r_min + r_off - 0.12)
-                r_maj_adj = max(r0 + 0.5, r_maj + r_off)
-                helix_wire = cq.Wire.makeHelix(
-                    pitch=pitch,
-                    height=h_helix,
-                    radius=r0,
-                    center=cq.Vector(0, 0, z_th_start),
-                )
-                tooth_h = r_maj_adj - r0
-                p_half = 0.44 * pitch
-                crest_half = 0.11 * pitch
-                tooth_face = (
-                    cq.Workplane("XZ")
-                    .moveTo(r0, z_th_start - p_half)
-                    .lineTo(r0 + tooth_h, z_th_start - crest_half)
-                    .lineTo(r0 + tooth_h, z_th_start + crest_half)
-                    .lineTo(r0, z_th_start + p_half)
-                    .close()
-                )
-                thread_sweep = tooth_face.sweep(helix_wire, isFrenet=True)
-                clip_pts = dedup_pts([
-                    (0.0, z_th_start - 0.8),
-                    (r0 + 0.1, z_th_start - 0.15),
-                    (r_maj_adj, z_th_start + 0.45),
-                    (r_maj_adj, z_th_start + h_helix - 0.45),
-                    (r0 + 0.1, z_th_start + h_helix + 0.15),
-                    (0.0, z_th_start + h_helix + 0.8),
-                ])
-                thread_clip = (
-                    cq.Workplane("XZ")
-                    .polyline(clip_pts)
-                    .close()
-                    .revolve(360, (0, 0, 0), (0, 1, 0))
-                )
-                thread_clean = thread_sweep.intersect(thread_clip)
-                solid = solid.union(thread_clean)
-            except Exception as e:
-                print(f"[WARN] Custom thread zone sweep skipped: {e}")
-
     return solid
 
 
@@ -1149,12 +1586,18 @@ def generate_visualizations(
     tol_mm = float(summary.get("specified_tolerance_mm", 0.50))
     archetype = summary.get("archetype", "hex_threaded_probe")
 
-    # Match the studio camera angle to the part archetype so the 3D render matches the photo perspective!
     if archetype == "multi_groove_spool":
-        # Orient the spool shaft from bottom-left (Z=0 threaded nose) to top-right (Z=70 spool head & tang)
-        # with the cross-drilled port hole facing the camera, matching Truning.jpg 1:1!
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-90.0, elevation=18.0, show_edges=False, part_tilt_x=54.0, part_tilt_z=-12.0)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-90.0, elevation=18.0, show_edges=True, part_tilt_x=54.0, part_tilt_z=-12.0)
+    elif archetype == "slotted_threaded_flange_bush":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-72.0, elevation=46.0, show_edges=False)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-72.0, elevation=46.0, show_edges=True)
+    elif archetype == "clevis_yoke_shaft":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-118.0, elevation=19.0, show_edges=False)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-118.0, elevation=19.0, show_edges=True)
+    elif archetype == "knurled_stepped_taper_spindle":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-65.0, elevation=21.0, show_edges=False)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-65.0, elevation=21.0, show_edges=True)
     else:
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-65.0, elevation=29.0, show_edges=False)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-65.0, elevation=29.0, show_edges=True)
@@ -1247,14 +1690,8 @@ def generate_visualizations(
         ]
         for text, xy, xytext, col in annotations:
             ax0.annotate(
-                text,
-                xy=xy,
-                xycoords="data",
-                xytext=xytext,
-                textcoords="data",
-                fontsize=7.6,
-                fontweight="bold",
-                color="white",
+                text, xy=xy, xycoords="data", xytext=xytext, textcoords="data",
+                fontsize=7.6, fontweight="bold", color="white",
                 bbox=dict(boxstyle="round,pad=0.28", facecolor=col, edgecolor="none", alpha=0.90),
                 arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.08", color=col, lw=1.6),
             )
@@ -1272,49 +1709,43 @@ def generate_visualizations(
         ]
         for text, xy, xytext, col in annotations:
             ax0.annotate(
-                text,
-                xy=xy,
-                xycoords="data",
-                xytext=xytext,
-                textcoords="data",
-                fontsize=7.6,
-                fontweight="bold",
-                color="white",
+                text, xy=xy, xycoords="data", xytext=xytext, textcoords="data",
+                fontsize=7.6, fontweight="bold", color="white",
                 bbox=dict(boxstyle="round,pad=0.28", facecolor=col, edgecolor="none", alpha=0.90),
                 arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.08", color=col, lw=1.6),
             )
         ax0.set_xlim(-15, 395)
         ax0.set_ylim(365, 0)
     else:
-        x_min, y_min, x_max, y_max = custom_profile["bbox"]
-        total_h = custom_profile["total_h_mm"]
-        palette = ["#0f766e", "#1d4ed8", "#4338ca", "#b45309", "#be123c", "#7e22ce", "#0369a1", "#15803d", "#9a3412", "#334155"]
+        bbox = summary["image_dimensions_px"].get("bbox", [int(0.2 * pw), int(0.1 * ph), int(0.8 * pw), int(0.9 * ph)])
+        x_min, y_min, x_max, y_max = bbox
+        total_h = float(summary["overall_height_nominal_mm"])
+        palette = ["#0f766e", "#1d4ed8", "#4338ca", "#b45309", "#be123c", "#7e22ce", "#0369a1", "#15803d", "#9a3412", "#334155", "#0f172a"]
         cx_mid = 0.5 * (x_min + x_max)
         for idx, s in enumerate(specs):
             z_mid = 0.5 * (s.z_start_mm + s.z_end_mm)
             y_px = y_max - (z_mid / max(1.0, total_h)) * (y_max - y_min)
             side_right = (idx % 2 == 0)
-            target_x = cx_mid + (0.22 if side_right else -0.22) * (x_max - x_min)
-            box_x = x_max + 0.08 * ph if side_right else x_min - 0.55 * ph
+            target_x = cx_mid + (0.20 if side_right else -0.20) * (x_max - x_min)
+            box_x = x_max + 0.05 * pw if side_right else x_min - 0.48 * pw
             col = palette[idx % len(palette)]
             ax0.annotate(
-                f"{s.feature_id}: {s.name}\n(Ø{s.diameter_nom_mm:.2f} ± {tol_mm:.2f} mm)",
+                f"{s.feature_id}: {s.name[:34]}\n(Ø{s.diameter_nom_mm:.2f} ± {tol_mm:.2f} mm)",
                 xy=(target_x, y_px),
                 xycoords="data",
                 xytext=(box_x, y_px),
                 textcoords="data",
-                fontsize=7.5,
+                fontsize=7.2,
                 fontweight="bold",
                 color="white",
-                bbox=dict(boxstyle="round,pad=0.26", facecolor=col, edgecolor="none", alpha=0.90),
+                bbox=dict(boxstyle="round,pad=0.24", facecolor=col, edgecolor="none", alpha=0.90),
                 arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.06", color=col, lw=1.5),
             )
-        ax0.set_xlim(x_min - 0.65 * ph, x_max + 0.65 * ph)
+        ax0.set_xlim(x_min - 0.58 * pw, x_max + 0.58 * pw)
         ax0.set_ylim(ph, 0)
 
     ax0.axis("off")
 
-    # Right subplot: Axial Diameter Profile with +/- tol_mm Bilateral Tolerance Band
     total_h_plot = float(summary["overall_height_nominal_mm"])
     z_samples = np.linspace(0.0, total_h_plot, 500)
     d_nom_curve = np.zeros_like(z_samples)
@@ -1487,6 +1918,21 @@ def convert_any_turning_image_to_step(
         solid_nom = build_multi_groove_spool_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_multi_groove_spool_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_multi_groove_spool_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+    elif archetype == "knurled_stepped_taper_spindle":
+        specs, summary = analyze_knurled_spindle_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_knurled_spindle_part(tol_offset_mm=0.00, helical_threads=helical_threads)
+        solid_mmc = build_knurled_spindle_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
+        solid_lmc = build_knurled_spindle_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+    elif archetype == "slotted_threaded_flange_bush":
+        specs, summary = analyze_slotted_flange_bush_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_slotted_flange_bush_part(tol_offset_mm=0.00, helical_threads=helical_threads)
+        solid_mmc = build_slotted_flange_bush_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
+        solid_lmc = build_slotted_flange_bush_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+    elif archetype == "clevis_yoke_shaft":
+        specs, summary = analyze_clevis_yoke_shaft_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_clevis_yoke_shaft_part(tol_offset_mm=0.00, helical_threads=helical_threads)
+        solid_mmc = build_clevis_yoke_shaft_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
+        solid_lmc = build_clevis_yoke_shaft_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
     else:
         specs, summary, custom_profile = extract_universal_turning_profile(
             img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px, orientation=orientation
