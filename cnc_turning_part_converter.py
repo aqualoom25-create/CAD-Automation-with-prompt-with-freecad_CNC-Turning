@@ -236,6 +236,7 @@ def classify_turning_part_archetype(img_path: str, repo_dir: str) -> str:
         ("knurled_stepped_taper_spindle", os.path.join(repo_dir, "reference_parts", "part3_knurled_spindle.jpeg")),
         ("slotted_threaded_flange_bush", os.path.join(repo_dir, "reference_parts", "part4_slotted_flange_bush.jpg")),
         ("clevis_yoke_shaft", os.path.join(repo_dir, "reference_parts", "part5_clevis_yoke_shaft.jpg")),
+        ("flanged_trepan_sleeve", os.path.join(repo_dir, "reference_parts", "part6_flanged_sleeve.jpg")),
     ]
 
     best_arch = None
@@ -899,6 +900,75 @@ def build_clevis_yoke_shaft_part(tol_offset_mm: float = 0.0, helical_threads: bo
     )
     solid = solid.cut(cross_hi)
 
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 5B: FLANGED TREPAN-GROOVED HOLLOW SLEEVE BUSH (RDL-Gallery-22.jpg)
+# ==============================================================================
+
+def analyze_flanged_trepan_sleeve_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Outer Circular Flange & Raised Rim Lip (T1 - Ø46.00 mm)", "CNC Lathe OD & Face Turning", 0.00, 7.50, 46.00, 306.7, "Large circular flange Ø46.00 mm with raised outer rim lip"),
+        ("F02", "Front Annular Face Trepanning Groove / Channel (G1)", "CNC Axial Face Trepanning", 0.00, 3.20, 39.20, 261.3, "Deep concave annular face groove (Ø39.20 outer / Ø28.40 mm inner)"),
+        ("F03", "Inner Raised Bore Spigot Lip (T2 - Ø28.40 mm)", "CNC Face Grooving & Boring", 0.00, 3.20, 28.40, 189.3, "Raised inner concentric collar lip surrounding the front bore"),
+        ("F04", "Flange-to-Barrel Rear Transition Shoulder (C1)", "CNC Corner Chamfer / Fillet Turning", 7.50, 8.80, 36.00, 240.0, "Smooth transition shoulder from Ø46.00 mm flange to Ø32.00 mm barrel"),
+        ("F05", "Rear Precision-Turned Cylindrical Barrel Body (T3)", "CNC Precision OD Finish Turning", 8.80, 34.00, 32.00, 213.3, "Main concentric cylindrical sleeve body Ø32.00 mm"),
+        ("F06", "Rear Barrel Outer & Inner Lead-In Chamfers (C2)", "CNC Facing & Chamfering", 33.20, 34.00, 31.00, 206.7, "0.80 mm x 45-deg rear entry chamfers"),
+        ("F07", "Front Inner Bore Chamfered Entrance (C3)", "CNC Internal Chamfering", 0.00, 1.00, 23.20, 154.7, "Chamfered inner bore rim at Z = 0.00 mm"),
+        ("F08", "Concentric Smooth Precision Through-Bore (B1 - Ø22.00 mm)", "CNC Internal Rough & Finish Boring", 0.00, 34.00, 22.00, 146.7, "Full-length concentric smooth through-bore Ø22.00 mm ID"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned Flanged Hollow Sleeve Bush with Annular Face Trepan Groove",
+        thread_spec=f"Hollow Through-Bore Ø22.00 mm + Annular Face Trepan Groove + Ø46.00 mm Flange (+/- {tol_mm:.2f} mm)",
+        max_od=46.00,
+        hex_af=46.00,
+        top_pin_d=22.00,
+        archetype="flanged_trepan_sleeve",
+    )
+
+
+def build_flanged_trepan_sleeve_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_flange   = max(15.0, 23.00 + r_off)
+    r_tr_out   = max(13.0, 19.80 + r_off)
+    r_tr_mid1  = max(12.0, 18.20 + r_off)
+    r_tr_mid2  = max(11.0, 15.60 + r_off)
+    r_tr_in    = max(10.0, 14.20 + r_off)
+    r_barrel   = max(11.5, 16.00 + r_off)
+    r_bore     = max(7.0,  11.00 - 0.3 * r_off)
+
+    rev_pts = dedup_pts([
+        (r_bore + 0.5, 0.00),
+        (r_barrel - 0.6, 0.00),
+        (r_barrel, 0.60),
+        (r_barrel, 25.50),
+        (r_barrel + 0.8, 26.50),
+        (r_flange - 0.5, 26.50),
+        (r_flange, 27.00),
+        (r_flange, 33.50),
+        (r_flange - 0.5, 34.00),
+        (r_tr_out + 0.4, 34.00),
+        (r_tr_out, 33.40),
+        (r_tr_mid1, 31.00),
+        (r_tr_mid2, 31.00),
+        (r_tr_in, 33.40),
+        (r_tr_in - 0.3, 34.00),
+        (r_bore + 0.6, 34.00),
+        (r_bore, 33.30),
+        (r_bore, 0.50),
+    ])
+
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
     return solid
 
 
@@ -1598,6 +1668,9 @@ def generate_visualizations(
     elif archetype == "knurled_stepped_taper_spindle":
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-65.0, elevation=21.0, show_edges=False)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-65.0, elevation=21.0, show_edges=True)
+    elif archetype == "flanged_trepan_sleeve":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-148.0, elevation=14.0, show_edges=False, part_tilt_x=-68.0, part_tilt_z=0.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-148.0, elevation=14.0, show_edges=True, part_tilt_x=-68.0, part_tilt_z=0.0)
     else:
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-65.0, elevation=29.0, show_edges=False)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-65.0, elevation=29.0, show_edges=True)
@@ -1933,6 +2006,11 @@ def convert_any_turning_image_to_step(
         solid_nom = build_clevis_yoke_shaft_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_clevis_yoke_shaft_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_clevis_yoke_shaft_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+    elif archetype == "flanged_trepan_sleeve":
+        specs, summary = analyze_flanged_trepan_sleeve_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_flanged_trepan_sleeve_part(tol_offset_mm=0.00)
+        solid_mmc = build_flanged_trepan_sleeve_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_flanged_trepan_sleeve_part(tol_offset_mm=-tol_mm)
     else:
         specs, summary, custom_profile = extract_universal_turning_profile(
             img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px, orientation=orientation
