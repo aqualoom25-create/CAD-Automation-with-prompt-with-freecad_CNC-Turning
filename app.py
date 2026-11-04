@@ -472,6 +472,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <button type="button" class="btn primary" onclick="loadPreset('clevis_shaft')" title="Load Clevis Yoke Pin Shaft (cnc-turned-parts-2.jpg)">
                 &#9881; Part 5: Clevis Yoke Shaft
               </button>
+              <button type="button" class="btn amber" onclick="loadPreset('flanged_sleeve')" title="Load Flanged Hollow Sleeve Bush (RDL-Gallery-22.jpg)">
+                &#9881; Part 6: Flanged Sleeve
+              </button>
+              <button type="button" class="btn primary" onclick="loadPreset('castellated_sleeve')" title="Load Castellated & Side-Slotted Housing Sleeve (5c6402097f62b5609.jpg)">
+                &#9881; Part 7: Castellated Sleeve
+              </button>
             </div>
           </div>
 
@@ -502,13 +508,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
+            <div class="form-row" style="grid-template-columns: 1.55fr 1fr; margin-top: 10px;">
+              <div class="form-group">
+                <label>&#129504; Vision Neural Prompt (Optional — e.g. "hollow sleeve, 4 front notches, 3 side slots")</label>
+                <input type="text" id="promptInput" name="user_prompt" placeholder="Auto-infer 3D perspective, hollow bore, slots, notches &amp; threads via Vision Neural Network..." />
+              </div>
+              <div class="form-group">
+                <label>&#128273; Gemini Vision API Key (Optional — Offline PyTorch Neural Engine Active by Default)</label>
+                <input type="password" id="geminiKeyInput" name="gemini_api_key" placeholder="AIzaSy... (or leave blank for Local PyTorch Vision)" />
+              </div>
+            </div>
+
             <div style="display:flex; gap:10px; margin-top:14px;">
               <button type="submit" class="btn success" id="convertBtn" style="flex:1; justify-content:center; padding:11px 16px; font-size:0.93rem;">
-                &#128640; Convert Uploaded Turning Part to 3D STEP &amp; Calculate &plusmn;0.50 mm Tolerance
+                &#128640; Run Vision Neural Network &amp; Synthesize 3D CSG B-Rep STEP (&plusmn;0.50 mm Tolerance)
               </button>
             </div>
             <div class="status-banner" id="statusBanner">
-              &#9881; Segmenting turning part silhouette, extracting axial features, building OpenCASCADE 3D B-Rep STEP solid, and rendering studio views...
+              &#9881; Running Vision Neural Network (3D Perspective + Bore/Slot Detection) &amp; Executing CadQuery 3D CSG B-Rep Booleans...
             </div>
           </form>
         </div>
@@ -531,6 +548,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+      {% if summary.vision_neural_network %}
+      <div class="card" style="margin-top: 22px;">
+        <div class="card-header">
+          <h2>&#129504; Vision Neural Network 3D Scene Graph &amp; Synthesized CadQuery 3D CSG Boolean Code</h2>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="badge green">{{ summary.vision_neural_network.engine_used }}</span>
+            <a class="btn primary" href="/download/generated_vision_csg_part.py">&#11015; Download 3D CSG Python Script (.py)</a>
+          </div>
+        </div>
+        <div style="display:grid; grid-template-columns: 1fr 1.35fr; gap: 16px;">
+          <div style="background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:14px;">
+            <div style="font-size:0.86rem; font-weight:700; color:var(--accent); margin-bottom:8px;">
+              3D Perspective, Occlusion &amp; Machining Semantics Detected:
+            </div>
+            <ul style="padding-left:18px; font-size:0.83rem; color:#cbd5e1; line-height:1.65;">
+              <li><strong>Hollow Bore / Tube:</strong> {{ "Yes (Through-Bore)" if summary.vision_neural_network.is_hollow else "Solid Shaft" }}</li>
+              <li><strong>Stepped Counterbore:</strong> {{ "Yes (Multi-Step Internal Counterbore)" if summary.vision_neural_network.has_stepped_counterbore else "Single Diameter / None" }}</li>
+              <li><strong>Castellated Rim Notches:</strong> {{ summary.vision_neural_network.castellated_notches if summary.vision_neural_network.castellated_notches else "None" }}</li>
+              <li><strong>Circumferential Side Windows:</strong> {{ summary.vision_neural_network.side_windows if summary.vision_neural_network.side_windows else "None" }}</li>
+              {% for note in summary.vision_neural_network.vision_reasoning_notes %}
+              <li>{{ note }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div style="background:#090d16; border:1px solid var(--border); border-radius:8px; padding:12px; overflow-x:auto;">
+            <div style="font-size:0.8rem; font-weight:700; color:#4ade80; margin-bottom:6px;">
+              Synthesized 3D CSG / B-Rep Boolean Operations (CadQuery OpenCASCADE):
+            </div>
+            <pre style="font-family:Consolas, monospace; font-size:0.78rem; color:#e2e8f0; white-space:pre-wrap; max-height:220px; overflow-y:auto;">{{ summary.vision_neural_network.generated_cadquery_code }}</pre>
+          </div>
+        </div>
+      </div>
+      {% endif %}
     </div>
 
     <!-- SECTION 2: INTERACTIVE 3D WEBGL VIEWER & STEP DOWNLOADS -->
@@ -758,6 +808,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       formData.append('tol_mm', document.getElementById('tolInput').value);
       formData.append('scale_mm_per_px', document.getElementById('scaleInput').value);
       formData.append('orientation', document.getElementById('orientInput').value);
+      formData.append('user_prompt', document.getElementById('promptInput').value);
+      formData.append('gemini_api_key', document.getElementById('geminiKeyInput').value);
 
       try {
         const res = await fetch('/api/upload_convert', {
@@ -934,6 +986,8 @@ def api_upload_convert():
         tol_mm = float(request.form.get("tol_mm", 0.50))
         scale_mm = float(request.form.get("scale_mm_per_px", 0.1500))
         orientation = request.form.get("orientation", "auto")
+        user_prompt = request.form.get("user_prompt", "")
+        gemini_api_key = request.form.get("gemini_api_key", "")
 
         file_obj = request.files.get("image")
         if file_obj and file_obj.filename:
@@ -952,6 +1006,8 @@ def api_upload_convert():
             scale_mm_per_px=scale_mm,
             orientation=orientation,
             helical_threads=True,
+            user_prompt=user_prompt,
+            gemini_api_key=gemini_api_key,
         )
         return jsonify({
             "status": "ok",
@@ -972,6 +1028,8 @@ def api_load_preset(preset_name):
         "knurled_spindle": (os.path.join(BASE_DIR, "reference_parts", "part3_knurled_spindle.jpeg"), 0.1500),
         "flange_bush": (os.path.join(BASE_DIR, "reference_parts", "part4_slotted_flange_bush.jpg"), 0.1500),
         "clevis_shaft": (os.path.join(BASE_DIR, "reference_parts", "part5_clevis_yoke_shaft.jpg"), 0.1500),
+        "flanged_sleeve": (os.path.join(BASE_DIR, "reference_parts", "part6_flanged_sleeve.jpg"), 0.1500),
+        "castellated_sleeve": (os.path.join(BASE_DIR, "reference_parts", "part7_castellated_sleeve.jpg"), 0.1500),
     }
     target, scale = preset_map.get(preset_name, (os.path.join(BASE_DIR, "reference_turning_part.png"), 0.1500))
     if not os.path.exists(target):

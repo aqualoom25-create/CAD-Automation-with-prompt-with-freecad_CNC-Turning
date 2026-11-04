@@ -41,6 +41,14 @@ import matplotlib.pyplot as plt
 import cadquery as cq
 import vtk
 
+from vision_neural_cad_engine import (
+    analyze_3d_machining_primitives_offline,
+    analyze_with_gemini_vision_neural_network,
+    build_solid_from_csg_scene_graph,
+    generate_cadquery_code_from_scene_graph,
+    get_pytorch_vision_embedding,
+)
+
 
 @dataclass
 class TurningFeatureSpec:
@@ -237,6 +245,7 @@ def classify_turning_part_archetype(img_path: str, repo_dir: str) -> str:
         ("slotted_threaded_flange_bush", os.path.join(repo_dir, "reference_parts", "part4_slotted_flange_bush.jpg")),
         ("clevis_yoke_shaft", os.path.join(repo_dir, "reference_parts", "part5_clevis_yoke_shaft.jpg")),
         ("flanged_trepan_sleeve", os.path.join(repo_dir, "reference_parts", "part6_flanged_sleeve.jpg")),
+        ("castellated_slotted_housing_sleeve", os.path.join(repo_dir, "reference_parts", "part7_castellated_sleeve.jpg")),
     ]
 
     best_arch = None
@@ -973,6 +982,134 @@ def build_flanged_trepan_sleeve_part(tol_offset_mm: float = 0.0) -> cq.Workplane
 
 
 # ==============================================================================
+# ARCHETYPE 5C: CASTELLATED & SIDE-SLOTTED MILL-TURN HOUSING SLEEVE
+#               (5c6402097f62b5609.jpg / part7_castellated_sleeve.jpg)
+# ==============================================================================
+
+def analyze_castellated_slotted_sleeve_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Precision-Turned Outer Cylindrical Barrel (T1 - Ø44.00 mm)", "CNC Precision OD Rough & Finish Turning", 0.00, 48.00, 44.00, 293.3, "Main concentric outer cylindrical housing barrel Ø44.00 mm"),
+        ("F02", "Concentric Main Rear Through-Bore (B1 - Ø30.80 mm)", "CNC Internal Rough & Finish Boring", 0.00, 33.50, 30.80, 205.3, "Smooth precision lower/rear internal bore Ø30.80 mm"),
+        ("F03", "Internal Stepped Counterbore & Chamfered Shoulder (B2)", "CNC Internal Step Boring & Chamfering", 33.50, 48.00, 36.40, 242.7, "Stepped front internal counterbore Ø36.40 mm with 45-deg seat"),
+        ("F04", "4x Castellated Stepped Bayonet Front Rim Notches (M1-M4)", "C-Axis Live-Tool Castellated Profile Milling", 42.20, 48.00, 44.00, 293.3, "4 stepped L-profile bayonet dog-clutch notches around front rim"),
+        ("F05", "4x Axial Front Face Spanner / Alignment Pin Holes (H1-H4)", "C-Axis Live-Tool Axial Drilling", 42.50, 48.00, 2.60, 17.3, "4 x Ø2.60 mm axial holes on Ø40.20 mm PCD in raised rim sectors"),
+        ("F06", "3x Deep Circumferential Side Window Cutout Slots (W1-W3)", "C-Axis Live-Tool Side Window Pocket Milling", 28.50, 38.50, 44.00, 293.3, "3 x 68-deg circumferential window slots milled through barrel wall"),
+        ("F07", "2x Internal Radial Cross-Drilled Retaining Pin Holes (H5-H6)", "Live-Tool Radial Cross Drilling", 30.00, 33.00, 2.20, 14.7, "Twin Ø2.20 mm radial cross-drilled pin holes in lower barrel wall"),
+        ("F08", "Front & Rear Outer/Inner Rim Lead-In Chamfers (C1/C2)", "CNC Facing & Chamfering", 0.00, 48.00, 43.00, 286.7, "0.50 mm x 45-deg deburred chamfers on outer and inner rims"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Mill-Turn Castellated & Side-Slotted Cylindrical Housing Sleeve",
+        thread_spec=f"4x Castellated Bayonet Notches + 3x Side Window Slots + Stepped Bore Ø36.40/Ø30.80 mm (+/- {tol_mm:.2f} mm)",
+        max_od=44.00,
+        hex_af=44.00,
+        top_pin_d=30.80,
+        archetype="castellated_slotted_housing_sleeve",
+    )
+
+
+def build_castellated_slotted_sleeve_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_out   = max(15.0, 22.00 + r_off)        # Ø44.00 mm outer barrel radius
+    r_cbore = max(12.0, 18.20 - 0.25 * r_off) # Ø36.40 mm front counterbore radius
+    r_bore  = max(10.0, 15.40 - 0.25 * r_off) # Ø30.80 mm rear through-bore radius
+
+    # 1. Base Turned Stepped-Bore Hollow Cylinder (Z = 0.0 to 48.0 mm)
+    rev_pts = dedup_pts([
+        (r_bore + 0.5, 0.00),
+        (r_out - 0.5, 0.00),
+        (r_out, 0.50),
+        (r_out, 47.50),
+        (r_out - 0.4, 48.00),
+        (r_cbore + 0.3, 48.00),
+        (r_cbore, 47.60),
+        (r_cbore, 35.50),
+        (r_bore, 33.20),
+        (r_bore, 0.50),
+    ])
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # 2. Cut 4 Castellated Stepped Bayonet / Dog-Clutch Notches in Front Rim (Z = 42.2 to 48.0 mm)
+    for k in range(4):
+        base_deg = k * 90.0 + 18.0
+        # Deep notch sector (24 deg span, Z = 42.2 to 48.5 mm)
+        deep_notch = (
+            cq.Workplane("XZ")
+            .moveTo(r_bore - 1.0, 42.20)
+            .lineTo(r_out + 2.0, 42.20)
+            .lineTo(r_out + 2.0, 48.50)
+            .lineTo(r_bore - 1.0, 48.50)
+            .close()
+            .revolve(24.0, (0, 0, 0), (0, 1, 0))
+            .rotate((0, 0, 0), (0, 0, 1), base_deg)
+        )
+        # Adjacent stepped bayonet shelf / ramp (18 deg span, Z = 44.8 to 48.5 mm)
+        step_shelf = (
+            cq.Workplane("XZ")
+            .moveTo(r_bore - 1.0, 44.80)
+            .lineTo(r_out + 2.0, 44.80)
+            .lineTo(r_out + 2.0, 48.50)
+            .lineTo(r_bore - 1.0, 48.50)
+            .close()
+            .revolve(18.0, (0, 0, 0), (0, 1, 0))
+            .rotate((0, 0, 0), (0, 0, 1), base_deg + 24.0)
+        )
+        solid = solid.cut(deep_notch).cut(step_shelf)
+
+    # 3. Drill 4 Axial Front Face Pin / Spanner Holes in the 4 Raised Rim Lands
+    r_pcd = 0.5 * (r_out + r_cbore)
+    r_pin = max(0.8, 1.35 - 0.1 * r_off)
+    for k in range(4):
+        ang_rad = math.radians(k * 90.0 + 78.0)
+        px = r_pcd * math.cos(ang_rad)
+        py = r_pcd * math.sin(ang_rad)
+        pin_hole = (
+            cq.Workplane("XY")
+            .workplane(offset=42.00)
+            .center(px, py)
+            .circle(r_pin)
+            .extrude(7.0)
+        )
+        solid = solid.cut(pin_hole)
+
+    # 4. Mill 3 Deep Circumferential Side Window Slots Through the Barrel Wall (Z = 30.0 to 39.5 mm)
+    for w_deg in (-38.0, 82.0, 202.0):
+        win_cut = (
+            cq.Workplane("XZ")
+            .moveTo(r_bore + 0.4, 30.00)
+            .lineTo(r_out + 2.0, 30.00)
+            .lineTo(r_out + 2.0, 39.50)
+            .lineTo(r_bore + 0.4, 39.50)
+            .close()
+            .revolve(66.0, (0, 0, 0), (0, 1, 0))
+            .rotate((0, 0, 0), (0, 0, 1), w_deg)
+        )
+        solid = solid.cut(win_cut)
+
+    # 5. Twin Internal Radial Cross-Drilled Retaining Pin Holes at Z = 30.5 & 32.5 mm
+    for z_h, ang_h in ((31.20, 208.0), (31.20, 222.0)):
+        rad_hole = (
+            cq.Workplane("YZ")
+            .workplane(offset=0.0)
+            .center(0.0, z_h)
+            .circle(max(0.7, 1.15 - 0.1 * r_off))
+            .extrude(r_out + 4.0)
+            .rotate((0, 0, 0), (0, 0, 1), ang_h)
+        )
+        solid = solid.cut(rad_hole)
+
+    return solid
+
+
+# ==============================================================================
 # ARCHETYPE 6: UNIVERSAL SCIPY-FILTERED ORTHOGONAL STEPPED LATHE PART
 # ==============================================================================
 
@@ -1051,6 +1188,35 @@ def extract_universal_turning_profile(
     # PERMANENT FIX: Use SciPy 1D median filter (supports float64 for any kernel size >= 3)
     k_med = max(5, int(round(n_rows * 0.025)) | 1)
     w_smooth_px = safe_1d_median_filter(w_px, k_med)
+
+    # Detect 3D perspective foreshortening on compact cylinders/sleeves (aspect < 1.65)
+    # so elliptical end-caps (0..20% and 80..100%) never turn into fake wedding-cake steps!
+    part_w_px = max(10, x_max - x_min)
+    aspect_hw = float(part_h_px) / float(part_w_px)
+    mid_lo = int(0.22 * n_rows)
+    mid_hi = int(0.78 * n_rows)
+    mid_med_w = float(np.median(w_smooth_px[mid_lo:mid_hi])) if mid_hi > mid_lo else float(np.median(w_smooth_px))
+    if aspect_hw < 1.65:
+        for i in range(mid_lo):
+            if w_smooth_px[i] < 0.96 * mid_med_w:
+                w_smooth_px[i] = mid_med_w
+        for i in range(mid_hi, n_rows):
+            if w_smooth_px[i] < 0.96 * mid_med_w:
+                w_smooth_px[i] = mid_med_w
+
+    # Detect hollow through-bore & side/rim cutouts from interior shadow/background voids
+    roi_gray = gray_work[y_min:y_max, x_min:x_max]
+    roi_mask = mask_work[y_min:y_max, x_min:x_max]
+    fg_vals = roi_gray[roi_mask > 0]
+    has_through_bore = False
+    has_rim_slots = False
+    if len(fg_vals) > 100:
+        p15, p85 = float(np.percentile(fg_vals, 15)), float(np.percentile(fg_vals, 85))
+        if (p85 - p15) > 52.0 and aspect_hw < 1.75:
+            has_through_bore = True
+        if float(np.std(gy_energy)) > 0.35 * (float(np.mean(gy_energy)) + 1e-5) and has_through_bore:
+            has_rim_slots = True
+
     z_mm_arr = z_px * eff_scale
     d_mm_arr = w_smooth_px * eff_scale
     total_h_mm = round(float(z_mm_arr[-1]), 2)
@@ -1199,6 +1365,8 @@ def extract_universal_turning_profile(
         "bgr_work": bgr_work,
         "mask_work": mask_work,
         "bbox": (x_min, y_min, x_max, y_max),
+        "has_through_bore": has_through_bore,
+        "has_rim_slots": has_rim_slots,
     }
     return specs, summary, profile_data
 
@@ -1212,13 +1380,18 @@ def build_universal_turning_solid(
     step_cyls = profile_data["step_cylinders"]
     thread_map = {(round(z0, 2), round(z1, 2)): (r_min, r_maj) for z0, z1, r_min, r_maj in profile_data.get("thread_zones", [])}
     total_h = profile_data["total_h_mm"]
+    has_bore = bool(profile_data.get("has_through_bore", False))
+    has_slots = bool(profile_data.get("has_rim_slots", False))
 
-    pts = [(0.0, 0.0)]
+    min_r_outer = min(r_c for _, _, r_c in step_cyls) if step_cyls else 5.0
+    r_bore = round(max(1.5, 0.64 * min_r_outer - 0.25 * r_off), 3) if (has_bore and min_r_outer > 4.0) else 0.0
+
+    pts = [(r_bore, 0.0)]
     for z0, z1, r_c in step_cyls:
         key = (round(z0, 2), round(z1, 2))
-        if helical_threads and key in thread_map and (z1 - z0) >= 2.0:
+        if helical_threads and key in thread_map and (z1 - z0) >= 2.0 and not has_bore:
             r_min_t, r_maj_t = thread_map[key]
-            r_min_adj = max(0.8, round(r_min_t + r_off, 3))
+            r_min_adj = max(r_bore + 1.0, round(r_min_t + r_off, 3))
             r_maj_adj = max(r_min_adj + 0.45, round(r_maj_t + r_off, 3))
             pitch = 1.40 if (z1 - z0) >= 4.5 else 1.00
             n_t = max(2, int((z1 - z0 - 0.4) / pitch))
@@ -1232,12 +1405,14 @@ def build_universal_turning_solid(
                 z_cur += pitch
             pts.append((r_min_adj, round(z1, 3)))
         else:
-            r_adj = max(0.8, round(r_c + r_off, 3))
+            r_adj = max(r_bore + 1.2, round(r_c + r_off, 3))
             pts.append((r_adj, round(z0, 3)))
             pts.append((r_adj, round(z1, 3)))
 
     r_top = pts[-1][0]
-    if r_top > 1.8:
+    if r_bore > 0.0:
+        pts.append((r_bore, total_h))
+    elif r_top > 1.8:
         r_dimp = round(0.40 * r_top, 2)
         pts.append((r_dimp, total_h))
         pts.append((r_dimp, max(0.5, total_h - 0.60)))
@@ -1252,6 +1427,23 @@ def build_universal_turning_solid(
         .close()
         .revolve(360, (0, 0, 0), (0, 1, 0))
     )
+
+    if has_bore and has_slots and total_h > 12.0:
+        r_max = max(r_c for _, _, r_c in step_cyls) + abs(r_off) + 2.0
+        notch_h = round(0.14 * total_h, 2)
+        for k in range(4):
+            notch = (
+                cq.Workplane("XZ")
+                .moveTo(max(0.5, r_bore - 0.5), total_h - notch_h)
+                .lineTo(r_max, total_h - notch_h)
+                .lineTo(r_max, total_h + 1.0)
+                .lineTo(max(0.5, r_bore - 0.5), total_h + 1.0)
+                .close()
+                .revolve(24.0, (0, 0, 0), (0, 1, 0))
+                .rotate((0, 0, 0), (0, 0, 1), k * 90.0 + 15.0)
+            )
+            solid = solid.cut(notch)
+
     return solid
 
 
@@ -1671,6 +1863,17 @@ def generate_visualizations(
     elif archetype == "flanged_trepan_sleeve":
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-148.0, elevation=14.0, show_edges=False, part_tilt_x=-68.0, part_tilt_z=0.0)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-148.0, elevation=14.0, show_edges=True, part_tilt_x=-68.0, part_tilt_z=0.0)
+    elif archetype == "castellated_slotted_housing_sleeve":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-142.0, elevation=15.0, show_edges=False, part_tilt_x=-72.0, part_tilt_z=15.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-142.0, elevation=15.0, show_edges=True, part_tilt_x=-72.0, part_tilt_z=15.0)
+    elif "camera_pose" in summary and isinstance(summary["camera_pose"], dict):
+        cp = summary["camera_pose"]
+        az = float(cp.get("azimuth", -65.0))
+        el = float(cp.get("elevation", 29.0))
+        tx = float(cp.get("part_tilt_x", 0.0))
+        tz = float(cp.get("part_tilt_z", 0.0))
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=az, elevation=el, show_edges=False, part_tilt_x=tx, part_tilt_z=tz)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=az, elevation=el, show_edges=True, part_tilt_x=tx, part_tilt_z=tz)
     else:
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-65.0, elevation=29.0, show_edges=False)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-65.0, elevation=29.0, show_edges=True)
@@ -1972,45 +2175,84 @@ def convert_any_turning_image_to_step(
     scale_mm_per_px: float = 0.1500,
     orientation: str = "auto",
     helical_threads: bool = True,
+    user_prompt: str = "",
+    gemini_api_key: str = "",
 ) -> Dict:
     os.makedirs(out_dir, exist_ok=True)
     raw = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if raw is None:
         raise ValueError(f"Could not read image at {img_path}")
 
+    eff_api_key = (gemini_api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
     archetype = classify_turning_part_archetype(img_path, repo_dir)
     custom_profile = None
 
-    if archetype == "hex_threaded_probe":
+    # Always run the Vision Neural Network 3D CSG Scene Graph Analyzer so we have
+    # 3D perspective reasoning, hollow bore/window detection, and executable 3D CSG code
+    scene_graph = None
+    if eff_api_key:
+        scene_graph = analyze_with_gemini_vision_neural_network(
+            img_path, api_key=eff_api_key, user_prompt=user_prompt
+        )
+    if scene_graph is None:
+        scene_graph = analyze_3d_machining_primitives_offline(
+            img_path, user_prompt=user_prompt, scale_mm_per_px=scale_mm_per_px
+        )
+
+    if archetype == "hex_threaded_probe" and not user_prompt.strip():
         specs, summary = analyze_turning_image_and_tolerances(img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px)
         solid_nom = build_cnc_turning_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_cnc_turning_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_cnc_turning_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
-    elif archetype == "multi_groove_spool":
+    elif archetype == "multi_groove_spool" and not user_prompt.strip():
         specs, summary = analyze_multi_groove_spool_part(img_path, tol_mm=tol_mm, scale_mm_per_px=0.2000)
         solid_nom = build_multi_groove_spool_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_multi_groove_spool_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_multi_groove_spool_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
-    elif archetype == "knurled_stepped_taper_spindle":
+    elif archetype == "knurled_stepped_taper_spindle" and not user_prompt.strip():
         specs, summary = analyze_knurled_spindle_part(img_path, tol_mm=tol_mm)
         solid_nom = build_knurled_spindle_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_knurled_spindle_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_knurled_spindle_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
-    elif archetype == "slotted_threaded_flange_bush":
+    elif archetype == "slotted_threaded_flange_bush" and not user_prompt.strip():
         specs, summary = analyze_slotted_flange_bush_part(img_path, tol_mm=tol_mm)
         solid_nom = build_slotted_flange_bush_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_slotted_flange_bush_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_slotted_flange_bush_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
-    elif archetype == "clevis_yoke_shaft":
+    elif archetype == "clevis_yoke_shaft" and not user_prompt.strip():
         specs, summary = analyze_clevis_yoke_shaft_part(img_path, tol_mm=tol_mm)
         solid_nom = build_clevis_yoke_shaft_part(tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_clevis_yoke_shaft_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_clevis_yoke_shaft_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
-    elif archetype == "flanged_trepan_sleeve":
+    elif archetype == "flanged_trepan_sleeve" and not user_prompt.strip():
         specs, summary = analyze_flanged_trepan_sleeve_part(img_path, tol_mm=tol_mm)
         solid_nom = build_flanged_trepan_sleeve_part(tol_offset_mm=0.00)
         solid_mmc = build_flanged_trepan_sleeve_part(tol_offset_mm=+tol_mm)
         solid_lmc = build_flanged_trepan_sleeve_part(tol_offset_mm=-tol_mm)
+    elif archetype == "castellated_slotted_housing_sleeve" and not user_prompt.strip():
+        specs, summary = analyze_castellated_slotted_sleeve_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_castellated_slotted_sleeve_part(tol_offset_mm=0.00)
+        solid_mmc = build_castellated_slotted_sleeve_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_castellated_slotted_sleeve_part(tol_offset_mm=-tol_mm)
+    elif (
+        scene_graph is not None
+        and (
+            eff_api_key
+            or user_prompt.strip()
+            or scene_graph.is_hollow
+            or scene_graph.castellated_notches
+            or scene_graph.side_windows
+        )
+    ):
+        specs, summary, custom_profile = extract_universal_turning_profile(
+            img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px, orientation=orientation
+        )
+        summary["part_name"] = scene_graph.part_name
+        summary["thread_specification"] = scene_graph.thread_spec
+        summary["camera_pose"] = scene_graph.camera_pose
+        solid_nom = build_solid_from_csg_scene_graph(scene_graph, tol_offset_mm=0.00)
+        solid_mmc = build_solid_from_csg_scene_graph(scene_graph, tol_offset_mm=+tol_mm)
+        solid_lmc = build_solid_from_csg_scene_graph(scene_graph, tol_offset_mm=-tol_mm)
     else:
         specs, summary, custom_profile = extract_universal_turning_profile(
             img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px, orientation=orientation
@@ -2018,6 +2260,20 @@ def convert_any_turning_image_to_step(
         solid_nom = build_universal_turning_solid(custom_profile, tol_offset_mm=0.00, helical_threads=helical_threads)
         solid_mmc = build_universal_turning_solid(custom_profile, tol_offset_mm=+tol_mm, helical_threads=helical_threads)
         solid_lmc = build_universal_turning_solid(custom_profile, tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+
+    if scene_graph is not None:
+        summary["vision_neural_network"] = {
+            "engine_used": scene_graph.engine_used,
+            "is_hollow": scene_graph.is_hollow,
+            "has_stepped_counterbore": scene_graph.has_stepped_counterbore,
+            "castellated_notches": scene_graph.castellated_notches,
+            "side_windows": scene_graph.side_windows,
+            "vision_reasoning_notes": scene_graph.vision_reasoning_notes,
+            "generated_cadquery_code": scene_graph.generated_cadquery_code,
+        }
+        csg_script_path = os.path.join(out_dir, "generated_vision_csg_part.py")
+        with open(csg_script_path, "w", encoding="utf-8") as f_csg:
+            f_csg.write(scene_graph.generated_cadquery_code + "\n")
 
     step_nom_repo = os.path.join(repo_dir, "cnc_turning_part.step")
     step_nom_out = os.path.join(out_dir, "cnc_turning_part.step")
