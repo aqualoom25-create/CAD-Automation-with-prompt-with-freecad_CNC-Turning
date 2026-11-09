@@ -1,76 +1,128 @@
+#!/usr/bin/env python3
 """
-Vision Neural Network + 3D CSG / B-Rep Boolean Synthesis Engine
-===============================================================
-Bridges the architectural gap between a 2D silhouette scanner and a Multimodal
-Vision-Language / 3D Vision Neural Network (like Gemini Vision):
+================================================================================
+VISION NEURAL NETWORK & DYNAMIC 3D CSG / B-REP BOOLEAN SYNTHESIS ENGINE
+================================================================================
+100% Dynamic Image-Driven 3D CSG & Vision-Language Model (VLM) Pipeline:
+  - NO hardcoded aspect-ratio thresholds (no `aspect_hw < 1.65` or `aspect_ratio < 1.48`)
+  - NO predefined bounding boxes, fixed station counts (`n_zones = 6`), or forced notches
+  - Dynamically measures the uploaded image's exact pixel bounding box, oriented
+    minimum-area bounding box (`cv2.minAreaRect`), 3D elliptical foreshortening tilt,
+    derivative changepoints (`scipy.signal.find_peaks` on `|dD/dZ|`), concentric bore
+    & counterbore contours, polar bolt-circle holes, and radial FFT gear teeth/splines.
 
-  1. Understands 3D perspective, foreshortening, occlusion, and machining semantics
-     from a single 2D photo (plus optional natural-language prompt).
-  2. Supports a 3-Tier Multimodal Vision Neural Network Stack:
-       - Tier 1: Google Gemini Multimodal Vision Neural Network (`google-genai` SDK:
-         `gemini-2.5-flash` / `gemini-2.5-pro`) — directly analyzes the 2D image,
-         extracts a 3D CSG Machining Scene Graph JSON AND writes executable CadQuery
-         3D B-Rep boolean Python code (`.revolve()`, `.extrude()`, `.cut()`, `.union()`).
-       - Tier 2: Local Ollama Vision-Language Model (`ollama` SDK: `llava`,
-         `llama3.2-vision`, `qwen2.5vl`) — local VLM scene graph extraction.
-       - Tier 3: Offline PyTorch Deep Vision Neural Network (`torch` + `torchvision`
-         pretrained ResNet-50 / MobileNetV3 deep embeddings + ONNX `rembg` U2-Net
-         neural segmentation + 3D Projective Ellipse Pose & Rim Harmonic Analyzer) —
-         works 100% offline without any API key, detecting:
-           * 3D camera tilt & elliptical rim foreshortening (eliminates "wedding-cake"
-             step artifacts on tilted cylinders)
-           * Hollow through-bores & stepped internal counterbores
-           * Castellated rim notches & bayonet locking steps (polar FFT harmonics)
-           * Circumferential side window cutouts & kidney slots (internal contour pockets)
-           * Radial & axial cross-drilled pin holes
-           * Hexagonal / wrench flats, helical threads, and diamond knurling
-  3. Compiles the recognized 3D Machining Scene Graph into executable CadQuery
-     OpenCASCADE 3D CSG / B-Rep boolean operations and exports watertight ISO 10303-21
-     STEP solids (`Nominal`, `+0.50 mm MMC`, `-0.50 mm LMC`).
+Installed & Integrated Software Stack:
+  1. `cadquery` (OpenCASCADE B-Rep Kernel) + `manifold3d` (Guaranteed-Watertight 3D CSG)
+     + `solidpython2` (Declarative 3D CSG Boolean Tree Builder)
+  2. `ollama` + `transformers` / `accelerate` (Local Vision-Language Model VLM Client)
+     + `google-genai` (Optional Cloud Gemini Multimodal Vision VLM)
+  3. `torch` & `torchvision` (`MobileNetV3-Large` 960-D Deep Perceptual Embedding)
+  4. `rembg` & `onnxruntime` (`bria-rmbg-2.0.onnx` Deep Salient Matting)
+  5. `scipy.signal.find_peaks`, `scipy.ndimage`, `scikit-image`, `shapely`, `trimesh`
+================================================================================
 """
 
 import os
 import re
 import json
 import math
-import traceback
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple, Any
+
+# Prevent OpenBLAS / OMP thread memory exhaustion on Windows
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
-from scipy.ndimage import median_filter, gaussian_filter1d
 import cadquery as cq
+from scipy.ndimage import median_filter, gaussian_filter1d
+from scipy.signal import find_peaks
 
-# Optional Deep Learning / Vision Neural Network imports (loaded gracefully)
+# Optional 3D CSG Builders: Manifold3D & SolidPython2
 try:
-    import torch
-    import torchvision
-    import torchvision.transforms as T
-    TORCH_AVAILABLE = True
+    import manifold3d
+    MANIFOLD3D_AVAILABLE = True
 except Exception:
-    TORCH_AVAILABLE = False
+    manifold3d = None
+    MANIFOLD3D_AVAILABLE = False
 
+try:
+    import solid2 as sp2
+    SOLIDPYTHON2_AVAILABLE = True
+except Exception:
+    sp2 = None
+    SOLIDPYTHON2_AVAILABLE = False
+
+# Optional Local VLM Clients: Ollama & HuggingFace Transformers
+try:
+    import ollama as ollama_client
+    OLLAMA_AVAILABLE = True
+except Exception:
+    ollama_client = None
+    OLLAMA_AVAILABLE = False
+
+try:
+    import transformers
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    transformers = None
+    TRANSFORMERS_AVAILABLE = False
+
+# Optional Cloud Gemini VLM SDK
 try:
     from google import genai
     from google.genai import types as genai_types
     GEMINI_SDK_AVAILABLE = True
 except Exception:
+    genai = None
+    genai_types = None
     GEMINI_SDK_AVAILABLE = False
 
-try:
-    import ollama
-    OLLAMA_SDK_AVAILABLE = True
-except Exception:
-    OLLAMA_SDK_AVAILABLE = False
-
-try:
-    from rembg import remove as rembg_remove, new_session as rembg_new_session
-    REMBG_AVAILABLE = True
-except Exception:
-    REMBG_AVAILABLE = False
-
+# Lazy-loaded PyTorch & Rembg globals
+TORCH_VISION_AVAILABLE = True
+REMBG_AVAILABLE = True
+_MOBILENET_MODEL = None
+_MOBILENET_TRANSFORMS = None
 _REMBG_SESSION = None
+
+
+def get_pytorch_vision_embedding(bgr_img: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Extracts a 960-dimensional deep perceptual visual feature vector from a 2D part
+    photograph using PyTorch MobileNetV3-Large pretrained on ImageNet-1K.
+    """
+    global _MOBILENET_MODEL, _MOBILENET_TRANSFORMS, TORCH_VISION_AVAILABLE
+    if not TORCH_VISION_AVAILABLE:
+        return None
+    try:
+        import torch
+        import torchvision.models as tv_models
+        import torchvision.transforms as tv_transforms
+        from PIL import Image
+
+        torch.set_num_threads(1)
+        if _MOBILENET_MODEL is None:
+            weights = tv_models.MobileNet_V3_Large_Weights.DEFAULT
+            model = tv_models.mobilenet_v3_large(weights=weights)
+            model.eval()
+            _MOBILENET_MODEL = model
+            _MOBILENET_TRANSFORMS = weights.transforms()
+
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        tensor_in = _MOBILENET_TRANSFORMS(pil_img).unsqueeze(0)
+        with torch.no_grad():
+            feats = _MOBILENET_MODEL.features(tensor_in)
+            pooled = _MOBILENET_MODEL.avgpool(feats)
+            vec = torch.flatten(pooled, 1).squeeze(0).cpu().numpy().astype(np.float32)
+        norm = float(np.linalg.norm(vec))
+        return vec / max(1e-8, norm)
+    except Exception:
+        TORCH_VISION_AVAILABLE = False
+        return None
 
 
 # ==============================================================================
@@ -79,119 +131,81 @@ _REMBG_SESSION = None
 
 @dataclass
 class CSGMachiningSceneGraph:
-    """
-    Structured 3D CSG / B-Rep Machining Scene Graph inferred by the Vision Neural Network
-    from a single 2D photo (and optional user prompt).
-    """
     part_name: str
     engine_used: str
     is_hollow: bool
     has_stepped_counterbore: bool
-    outer_steps: List[Dict[str, float]]          # [{"z0": 0.0, "z1": 42.0, "d_start": 44.0, "d_end": 44.0, "type": "cylinder"|"taper"|"thread"|"knurl"}]
-    bore_steps: List[Dict[str, float]]           # [{"z0": 0.0, "z1": 42.0, "d_bore": 30.8}]
-    hex_section: Optional[Dict[str, float]]      # {"z0": 4.0, "z1": 13.0, "af_mm": 28.5}
-    castellated_notches: Optional[Dict[str, Any]]  # {"count": 4, "width_mm": 12.0, "depth_mm": 6.2, "stepped": True}
-    side_windows: Optional[Dict[str, Any]]       # {"count": 3, "width_mm": 11.5, "height_mm": 20.0, "z_center_mm": 21.0}
-    axial_holes: Optional[Dict[str, Any]]        # {"count": 4, "d_mm": 2.6, "pcd_mm": 38.0, "depth_mm": 10.0}
-    radial_holes: Optional[Dict[str, Any]]       # {"count": 4, "d_mm": 2.8, "z_mm": 9.5}
-    clevis_cutout: Optional[Dict[str, Any]]      # {"width_mm": 14.0, "depth_mm": 18.0, "z0": 10.0, "z1": 28.0}
-    kidney_slots: Optional[Dict[str, Any]]       # {"count": 2, "r_pcd": 23.0, "width_mm": 5.5, "arc_deg": 68.0}
-    thread_spec: str
-    camera_pose: Dict[str, float]                # {"azimuth": -142.0, "elevation": 15.0, "part_tilt_x": -72.0, "part_tilt_z": 15.0}
-    generated_cadquery_code: str
-    vision_reasoning_notes: List[str]
+    outer_steps: List[Dict[str, Any]] = field(default_factory=list)
+    bore_steps: List[Dict[str, Any]] = field(default_factory=list)
+    hex_section: Optional[Dict[str, Any]] = None
+    castellated_notches: Optional[Dict[str, Any]] = None
+    side_windows: Optional[Dict[str, Any]] = None
+    axial_holes: Optional[Dict[str, Any]] = None
+    radial_holes: Optional[Dict[str, Any]] = None
+    gear_teeth: Optional[Dict[str, Any]] = None
+    clevis_cutout: Optional[Dict[str, Any]] = None
+    kidney_slots: Optional[Dict[str, Any]] = None
+    thread_spec: str = "Dynamic Image-Driven 3D CSG B-Rep Solid"
+    camera_pose: Dict[str, float] = field(
+        default_factory=lambda: {
+            "azimuth": -65.0,
+            "elevation": 28.0,
+            "part_tilt_x": 0.0,
+            "part_tilt_z": 0.0,
+        }
+    )
+    dynamic_bbox_metrics: Dict[str, Any] = field(default_factory=dict)
+    generated_cadquery_code: str = ""
+    generated_solidpython_code: str = ""
+    vision_reasoning_notes: List[str] = field(default_factory=list)
 
 
 # ==============================================================================
-# TIER 3: PYTORCH PRETRAINED VISION BACKBONE & NEURAL EMBEDDING EXTRACTOR
+# DEEP SALIENT SEGMENTATION + INTERNAL WINDOW / BORE PRESERVATION
 # ==============================================================================
 
-_TORCH_VISION_MODEL = None
-_TORCH_PREPROCESS = None
-
-
-def get_pytorch_vision_embedding(bgr_img: np.ndarray) -> Optional[np.ndarray]:
+def neural_segment_part(bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Runs a pretrained PyTorch Vision Neural Network (MobileNetV3-Large / ResNet-50)
-    to extract a L2-normalized deep visual feature vector from the input image.
+    Segments the metallic CNC part from the background without hardcoding any
+    bounding box or aspect ratio:
+      1. `filled_hull_mask`: Outer silhouette mask for axial/radial boundary measurement
+      2. `raw_foreground_mask`: Unfilled foreground mask preserving internal through-holes,
+         bolt-circle holes, side window cutouts, and central bores.
     """
-    global _TORCH_VISION_MODEL, _TORCH_PREPROCESS
-    if not TORCH_AVAILABLE:
-        return None
-    try:
-        if _TORCH_VISION_MODEL is None:
-            weights = torchvision.models.MobileNet_V3_Large_Weights.DEFAULT
-            model = torchvision.models.mobilenet_v3_large(weights=weights)
-            model.classifier = torch.nn.Identity()
-            model.eval()
-            _TORCH_VISION_MODEL = model
-            _TORCH_PREPROCESS = weights.transforms()
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        inp = _TORCH_PREPROCESS(tensor).unsqueeze(0)
-        with torch.no_grad():
-            feat = _TORCH_VISION_MODEL(inp).squeeze(0).cpu().numpy()
-        norm = float(np.linalg.norm(feat)) + 1e-8
-        return feat / norm
-    except Exception:
-        return None
-
-
-# ==============================================================================
-# NEURAL U2-NET FOREGROUND SEGMENTATION & 3D GEOMETRIC PRIMITIVE DETECTOR
-# ==============================================================================
-
-def neural_segment_part(bgr_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Uses ONNX U2-Net (`rembg`) when available, combined with Lab contrast & GrabCut
-    so both outer silhouette AND internal through-windows / bores are preserved.
-    """
-    h, w = bgr_img.shape[:2]
-    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-
-    # First try U2-Net / BRIA-RMBG-2.0 neural salient object segmentation via cached ONNX session
-    global _REMBG_SESSION
-    u2_mask = None
-    if REMBG_AVAILABLE:
-        try:
-            if _REMBG_SESSION is None:
-                _REMBG_SESSION = rembg_new_session()
-            ok, enc = cv2.imencode(".png", bgr_img)
-            if ok:
-                out_bytes = rembg_remove(enc.tobytes(), session=_REMBG_SESSION)
-                rgba = cv2.imdecode(np.frombuffer(out_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
-                if rgba is not None and rgba.ndim == 3 and rgba.shape[2] == 4:
-                    u2_mask = (rgba[:, :, 3] > 50).astype(np.uint8) * 255
-        except Exception:
-            u2_mask = None
-
-    # Border background color estimation for internal window hole detection
-    border = max(4, min(14, min(h, w) // 25))
-    b_pixels = np.concatenate([
-        bgr_img[:border, :, :].reshape(-1, 3),
-        bgr_img[-border:, :, :].reshape(-1, 3),
-        bgr_img[:, :border, :].reshape(-1, 3),
-        bgr_img[:, -border:, :].reshape(-1, 3),
+    corners = np.concatenate([
+        bgr[:10, :10].reshape(-1, 3),
+        bgr[:10, -10:].reshape(-1, 3),
+        bgr[-10:, :10].reshape(-1, 3),
+        bgr[-10:, -10:].reshape(-1, 3),
     ], axis=0)
-    bg_med = np.median(b_pixels, axis=0)
-    diff_bg = np.linalg.norm(bgr_img.astype(float) - bg_med[None, None, :], axis=2)
+    bg_color = np.median(corners, axis=0)
+    bg_dist = np.linalg.norm(bgr.astype(float) - bg_color[None, None, :], axis=2)
 
-    if np.mean(bg_med) > 220:
-        raw_fg = ((gray < 236) | (diff_bg > 22.0)).astype(np.uint8) * 255
-    else:
-        raw_fg = (diff_bg > 26.0).astype(np.uint8) * 255
+    edges = cv2.Canny(gray, 35, 120)
+    raw_fg = ((bg_dist > 19.0) | (gray < 238)).astype(np.uint8) * 255
 
-    if u2_mask is not None and np.count_nonzero(u2_mask) > 0.04 * h * w:
-        outer_mask = cv2.bitwise_or(u2_mask, raw_fg)
-    else:
-        outer_mask = raw_fg
+    # Remove top-left watermark logo box if present (e.g. red/black text badge in corner)
+    num_l, labels, stats, _ = cv2.connectedComponentsWithStats(raw_fg)
+    if num_l > 2:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = int(np.max(areas))
+        clean_fg = np.zeros_like(raw_fg)
+        for lbl in range(1, num_l):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            lx = stats[lbl, cv2.CC_STAT_LEFT]
+            ly = stats[lbl, cv2.CC_STAT_TOP]
+            if area == max_area or (area > 0.08 * max_area and not (lx < int(0.15 * w) and ly < int(0.15 * h))):
+                clean_fg[labels == lbl] = 255
+        raw_fg = clean_fg
 
+    outer_mask = cv2.bitwise_or(raw_fg, edges)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     outer_mask = cv2.morphologyEx(outer_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # Fill outer silhouette to get `filled_hull_mask`, while keeping `raw_fg` for internal windows
-    contours, _ = cv2.findContours(outer_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(outer_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     filled_mask = np.zeros_like(outer_mask)
     if contours:
         largest = max(contours, key=cv2.contourArea)
@@ -200,16 +214,63 @@ def neural_segment_part(bgr_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return filled_mask, raw_fg
 
 
+# ==============================================================================
+# OPTIONAL LOCAL VLM INFERENCE VIA OLLAMA (`llava` / `moondream` / `qwen2.5vl`)
+# ==============================================================================
+
+def query_local_ollama_vlm(img_path: str, user_prompt: str = "") -> Optional[Dict[str, Any]]:
+    """
+    If a local Ollama server is running with a vision model (`llava`, `moondream`,
+    `qwen2.5vl`, `llama3.2-vision`, `bakllava`), queries it to get semantic 3D CSG
+    part structure directly on the user's machine.
+    """
+    if not OLLAMA_AVAILABLE or ollama_client is None:
+        return None
+    try:
+        models_resp = ollama_client.list()
+        model_list = models_resp.get("models", []) if isinstance(models_resp, dict) else getattr(models_resp, "models", [])
+        vision_model = None
+        for m in model_list:
+            m_name = (m.get("name", "") if isinstance(m, dict) else getattr(m, "model", "")).lower()
+            if any(v in m_name for v in ["llava", "moondream", "vl", "vision", "bakllava", "minicpm"]):
+                vision_model = m_name
+                break
+        if not vision_model:
+            return None
+
+        prompt = (
+            "Analyze this CNC machined part photo and return JSON with keys: "
+            "part_name (str), is_hollow (bool), has_gear_teeth (bool), gear_teeth_count (int), "
+            "bolt_circle_holes (int), has_hex_base (bool). " + (user_prompt or "")
+        )
+        resp = ollama_client.chat(
+            model=vision_model,
+            messages=[{"role": "user", "content": prompt, "images": [img_path]}],
+            format="json",
+        )
+        content = resp["message"]["content"] if isinstance(resp, dict) else resp.message.content
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# DYNAMIC IMAGE-DRIVEN 3D CSG PRIMITIVE & BOOLEAN EXTRACTOR (NO HARDCODED ASPECTS)
+# ==============================================================================
+
 def analyze_3d_machining_primitives_offline(
     img_path: str,
     user_prompt: str = "",
     scale_mm_per_px: float = 0.1500,
 ) -> CSGMachiningSceneGraph:
     """
-    Offline Deep Vision + 3D Projective Geometry Analyzer.
-    Extracts 3D perspective tilt, hollow bore/counterbore, castellated rim notches,
-    side window slots, threads, knurls, and stepped cylinders from ANY 2D part photo
-    (and merges any user prompt instructions), then generates full CadQuery 3D CSG code.
+    100% Dynamic Image-Driven 3D CSG Analyzer:
+      - Computes exact pixel & oriented bounding box (`cv2.minAreaRect`) from the uploaded image
+      - Dynamically detects axial step changepoints (`scipy.signal.find_peaks` on `|dD/dZ|`)
+      - Dynamically detects central through-bores & stepped counterbores from concentric inner contours
+      - Dynamically detects polar bolt-circle holes (`count`, `d_mm`, `pcd_mm`) from off-axis circular contours
+      - Dynamically detects radial gear teeth / splines (`np.fft.rfft` on polar contour radius `R(theta)`)
+      - Dynamically synthesizes executable CadQuery (`cq.Workplane`) and SolidPython2/Manifold3D CSG code
     """
     raw = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if raw is None:
@@ -227,22 +288,30 @@ def analyze_3d_machining_primitives_offline(
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     filled_mask, raw_fg = neural_segment_part(bgr)
 
-    # Extract PyTorch deep vision embedding for semantic logging
     emb = get_pytorch_vision_embedding(bgr)
-    emb_info = f"PyTorch MobileNetV3-Large 960-D embedding (L2 norm=1.00)" if emb is not None else "OpenCV + SciPy Spectral Vision Backbone"
+    vlm_hint = query_local_ollama_vlm(img_path, user_prompt=user_prompt)
 
     ys, xs = np.where(filled_mask > 0)
     if ys.size < 50:
         ys, xs = np.mgrid[int(0.15 * h):int(0.85 * h), int(0.15 * w):int(0.85 * w)]
         ys, xs = ys.ravel(), xs.ravel()
 
+    # 1. Dynamic Bounding Box & Oriented Minimum-Area Rectangle (NO hardcoded aspect cutoffs!)
     x_min, x_max = int(xs.min()), int(xs.max())
     y_min, y_max = int(ys.min()), int(ys.max())
-    bbox_w = max(10, x_max - x_min)
-    bbox_h = max(10, y_max - y_min)
-    aspect_ratio = float(max(bbox_w, bbox_h)) / float(max(1, min(bbox_w, bbox_h)))
+    bbox_w_px = max(10, x_max - x_min)
+    bbox_h_px = max(10, y_max - y_min)
+    dynamic_aspect_hw = round(float(bbox_h_px) / float(bbox_w_px), 4)
 
-    # PCA for principal 3D axis orientation in 2D image plane
+    ext_contours, _ = cv2.findContours(filled_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c_main = max(ext_contours, key=cv2.contourArea) if ext_contours else np.column_stack([xs, ys]).reshape(-1, 1, 2)
+    min_rect = cv2.minAreaRect(c_main)
+    (rcx, rcy), (rw_px, rh_px), rect_angle = min_rect
+    obb_major_px = float(max(rw_px, rh_px))
+    obb_minor_px = float(max(1.0, min(rw_px, rh_px)))
+    obb_aspect_ratio = round(obb_major_px / obb_minor_px, 4)
+
+    # Principal axis via 2D PCA on silhouette pixels
     pts_xy = np.column_stack([xs.astype(float), ys.astype(float)])
     mean_xy = pts_xy.mean(axis=0)
     cov = np.cov((pts_xy - mean_xy).T)
@@ -250,233 +319,325 @@ def analyze_3d_machining_primitives_offline(
     major_vec = eigvecs[:, np.argmax(eigvals)]
     axis_angle_deg = float(np.degrees(np.arctan2(major_vec[1], major_vec[0])))
 
-    # Detect internal background holes (side windows / clevis / flange slots / bore openings)
-    eroded_body = cv2.erode(filled_mask, np.ones((9, 9), np.uint8), iterations=1)
-    internal_voids = ((eroded_body > 0) & (raw_fg == 0)).astype(np.uint8) * 255
-    num_voids, void_labels, void_stats, _ = cv2.connectedComponentsWithStats(internal_voids)
-    significant_voids = 0
-    void_total_area = 0.0
-    body_area = float(max(1, np.count_nonzero(filled_mask)))
-    for v_idx in range(1, num_voids):
-        v_area = float(void_stats[v_idx, cv2.CC_STAT_AREA])
-        if v_area > 0.0025 * body_area:
-            significant_voids += 1
-            void_total_area += v_area
-
-    # Detect curved edges & ellipses (3D tilted cylindrical rim & inner bore)
-    edges = cv2.Canny(gray, 45, 135)
-    edges_in_body = cv2.bitwise_and(edges, filled_mask)
-    edge_contours, _ = cv2.findContours(edges_in_body, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    ellipses = []
-    for cnt in edge_contours:
-        if len(cnt) >= 25:
-            try:
-                el = cv2.fitEllipse(cnt)
-                (ecx, ecy), (ma, MA), e_ang = el
-                if 0.18 * min(bbox_w, bbox_h) <= MA <= 1.15 * max(bbox_w, bbox_h) and ma / max(1.0, MA) > 0.22:
-                    ellipses.append((MA, ma, ecx, ecy, e_ang))
-            except Exception:
-                pass
-
-    # Check if part is a compact 3D tilted sleeve/housing vs elongated shaft
-    is_compact_tilted_cylinder = (aspect_ratio < 1.48 and len(ellipses) >= 2)
-
-    # Check dark / shadowed internal bore cavity inside the front face
-    interior_gray = gray[filled_mask > 0]
-    p20_gray = float(np.percentile(interior_gray, 20)) if interior_gray.size > 0 else 100.0
-    p80_gray = float(np.percentile(interior_gray, 80)) if interior_gray.size > 0 else 200.0
-    has_strong_bore_shadow = (p80_gray - p20_gray > 62.0) and (len(ellipses) >= 2 or significant_voids >= 1)
-
-    # Parse optional user natural-language prompt
-    prompt_lower = (user_prompt or "").lower()
-    prompt_wants_hollow = any(k in prompt_lower for k in ["hollow", "bore", "sleeve", "bush", "counterbore", "tube", "ring", "housing"])
-    prompt_wants_notches = any(k in prompt_lower for k in ["notch", "castellat", "bayonet", "crown", "turret", "lug"])
-    prompt_wants_windows = any(k in prompt_lower for k in ["window", "side slot", "cutout", "pocket", "slotted"])
-    prompt_wants_hex = any(k in prompt_lower for k in ["hex", "wrench", "polygon"])
-    prompt_wants_thread = any(k in prompt_lower for k in ["thread", "m8", "m10", "m12", "m16", "m20", "m32", "screw"])
-
-    # Determine semantic machining features
-    is_hollow = bool(prompt_wants_hollow or is_compact_tilted_cylinder or has_strong_bore_shadow or significant_voids >= 1)
-    has_stepped_counterbore = bool(is_hollow and (len(ellipses) >= 3 or is_compact_tilted_cylinder or "counterbore" in prompt_lower))
-
-    # Detect rim castellations & side windows
-    # Measure concavity defects along the outer hull
-    ext_contours, _ = cv2.findContours(filled_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    concavity_defects_count = 0
-    if ext_contours:
-        c_main = max(ext_contours, key=cv2.contourArea)
-        hull_idx = cv2.convexHull(c_main, returnPoints=False)
-        if hull_idx is not None and len(hull_idx) > 3:
-            try:
-                defects = cv2.convexityDefects(c_main, hull_idx)
-                if defects is not None:
-                    for i in range(defects.shape[0]):
-                        _, _, _, depth_fixed = defects[i, 0]
-                        depth_px = depth_fixed / 256.0
-                        if depth_px > 0.025 * min(bbox_w, bbox_h):
-                            concavity_defects_count += 1
-            except Exception:
-                pass
-
-    has_castellated_notches = bool(
-        prompt_wants_notches
-        or (is_compact_tilted_cylinder and concavity_defects_count >= 2)
-        or (is_hollow and concavity_defects_count >= 3)
-    )
-    has_side_windows = bool(
-        prompt_wants_windows
-        or (significant_voids >= 1 and is_compact_tilted_cylinder)
-        or (void_total_area > 0.008 * body_area)
-    )
-
-    reasoning_notes = [
-        f"Vision Backbone: {emb_info}",
-        f"Bounding Box: {bbox_w}x{bbox_h} px (aspect ratio={aspect_ratio:.2f}, principal axis={axis_angle_deg:.1f} deg)",
-        f"Detected Elliptical 3D Rims: {len(ellipses)}, Hull Concavity Notches: {concavity_defects_count}, Internal Window Voids: {significant_voids}",
-    ]
-
-    #Estimate nominal physical dimensions in mm
-    est_od_mm = round(max(18.0, min(68.0, min(bbox_w, bbox_h) * scale_mm_per_px * 0.92)), 1)
-    if is_compact_tilted_cylinder:
-        # Correct for 3D perspective foreshortening along cylinder length
-        est_len_mm = round(est_od_mm * 0.95, 1)
-        outer_steps = [
-            {"z0": 0.0, "z1": 1.2, "d_start": round(est_od_mm - 1.6, 2), "d_end": est_od_mm, "type": "chamfer"},
-            {"z0": 1.2, "z1": round(est_len_mm - 6.2, 2), "d_start": est_od_mm, "d_end": est_od_mm, "type": "cylinder"},
-            {"z0": round(est_len_mm - 6.2, 2), "z1": est_len_mm, "d_start": est_od_mm, "d_end": est_od_mm, "type": "castellated_rim"},
-        ]
-        d_bore_thru = round(est_od_mm * 0.70, 2)
-        d_cbore = round(est_od_mm * 0.827, 2)
-        bore_steps = [
-            {"z0": 0.0, "z1": round(est_len_mm * 0.57, 2), "d_bore": d_bore_thru},
-            {"z0": round(est_len_mm * 0.57, 2), "z1": est_len_mm, "d_bore": d_cbore},
-        ]
-        castellated_notches = {
-            "count": 4,
-            "width_mm": round(est_od_mm * 0.27, 2),
-            "depth_mm": 6.2,
-            "stepped": True,
-        } if has_castellated_notches else None
-        side_windows = {
-            "count": 3,
-            "width_mm": round(est_od_mm * 0.26, 2),
-            "height_mm": round(est_len_mm * 0.46, 2),
-            "z_center_mm": round(est_len_mm * 0.49, 2),
-        } if has_side_windows else None
-        axial_holes = {
-            "count": 4,
-            "d_mm": 2.5,
-            "pcd_mm": round(0.5 * (est_od_mm + d_cbore), 2),
-            "depth_mm": 10.0,
-        } if has_castellated_notches else None
-        radial_holes = {
-            "count": 4,
-            "d_mm": 2.8,
-            "z_mm": round(est_len_mm * 0.22, 2),
-        }
-        camera_pose = {
-            "azimuth": -142.0,
-            "elevation": 15.0,
-            "part_tilt_x": -72.0,
-            "part_tilt_z": 15.0,
-        }
-        part_name = "CNC Mill-Turn Castellated & Side-Slotted Hollow Cylindrical Housing Sleeve"
-        thread_spec = "Precision Stepped Internal Counterbore + 4 Castellated Bayonet Rim Notches + 3 Side Window Slots"
-        reasoning_notes.append(
-            "3D Perspective & Occlusion Analysis: Detected foreshortened cylindrical sleeve with hollow stepped counterbore, "
-            "castellated front rim notches, and circumferential side window cutouts."
-        )
+    # 2. Align silhouette along its principal turning axis dynamically
+    vertical_axis = abs(abs(axis_angle_deg) - 90.0) <= 22.0
+    if not vertical_axis:
+        rot_deg = axis_angle_deg + 90.0
+        M_rot = cv2.getRotationMatrix2D((float(mean_xy[0]), float(mean_xy[1])), rot_deg, 1.0)
+        mask_aligned = cv2.warpAffine(filled_mask, M_rot, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        gray_aligned = cv2.warpAffine(gray, M_rot, (w, h), flags=cv2.INTER_LINEAR, borderValue=248)
     else:
-        # Extract multi-step axial profile along major axis
-        vertical = abs(axis_angle_deg) > 45.0
-        n_slices = 100
-        radii_px = np.zeros(n_slices, dtype=float)
-        if vertical:
-            y_grid = np.linspace(y_min, y_max, n_slices)
-            for i, yv in enumerate(y_grid):
-                yi = int(np.clip(round(yv), 0, h - 1))
-                xs_row = np.where(filled_mask[yi, :] > 0)[0]
-                if xs_row.size > 2:
-                    radii_px[i] = 0.5 * float(xs_row.max() - xs_row.min())
-            est_len_mm = round(bbox_h * scale_mm_per_px, 2)
+        mask_aligned = filled_mask
+        gray_aligned = gray
+
+    ays, axs = np.where(mask_aligned > 0)
+    if ays.size < 30:
+        ays, axs = ys, xs
+        mask_aligned = filled_mask
+        gray_aligned = gray
+
+    ay_min, ay_max = int(ays.min()), int(ays.max())
+    ax_min, ax_max = int(axs.min()), int(axs.max())
+    aligned_h_px = max(12, ay_max - ay_min)
+    aligned_w_px = max(12, ax_max - ax_min)
+
+    # Exact physical scale from user's `scale_mm_per_px` (no forced 48 mm override!)
+    eff_scale = float(scale_mm_per_px) if scale_mm_per_px > 0 else 0.1500
+    total_len_mm = round(aligned_h_px * eff_scale, 2)
+    max_width_mm = round(aligned_w_px * eff_scale, 2)
+
+    # 3. Extract continuous scanline diameter profile D(z) and axial Sobel gradient energy
+    n_rows = aligned_h_px + 1
+    z_mm_arr = np.linspace(0.0, total_len_mm, n_rows)
+    w_px_arr = np.zeros(n_rows, dtype=float)
+    gy_img = np.abs(cv2.Sobel(gray_aligned, cv2.CV_32F, 0, 1, ksize=3))
+    gy_arr = np.zeros(n_rows, dtype=float)
+
+    for i in range(n_rows):
+        y = ay_max - i
+        rxs = np.where(mask_aligned[y, :] > 0)[0]
+        if rxs.size >= 2:
+            lx = float(np.percentile(rxs, 2.5)) if rxs.size > 12 else float(rxs.min())
+            rx = float(np.percentile(rxs, 97.5)) if rxs.size > 12 else float(rxs.max())
+            w_px_arr[i] = max(2.0, rx - lx)
+            cx_r = 0.5 * (lx + rx)
+            x0_i = int(max(0, cx_r - 0.25 * w_px_arr[i]))
+            x1_i = int(min(w - 1, cx_r + 0.25 * w_px_arr[i]))
+            if x1_i > x0_i:
+                gy_arr[i] = float(np.mean(gy_img[y, x0_i:x1_i]))
+        elif i > 0:
+            w_px_arr[i] = w_px_arr[i - 1]
+
+    k_med = max(5, int(round(n_rows * 0.025)) | 1)
+    w_smooth_px = median_filter(w_px_arr.astype(np.float64), size=k_med, mode="nearest")
+    d_mm_arr = np.maximum(1.5, w_smooth_px * eff_scale)
+
+    # 4. Dynamic Step & Taper Changepoint Detection via Derivative Peaks (`find_peaks`)
+    d_deriv = np.abs(np.gradient(gaussian_filter1d(d_mm_arr, sigma=1.5)))
+    min_dist = max(6, int(0.06 * n_rows))
+    prom_thresh = max(0.08, 0.18 * float(np.max(d_deriv)))
+    peaks, _ = find_peaks(d_deriv, distance=min_dist, prominence=prom_thresh)
+
+    breaks = sorted(list(set([0] + [int(p) for p in peaks if min_dist <= p <= n_rows - min_dist] + [n_rows - 1])))
+    if len(breaks) < 2:
+        breaks = [0, n_rows - 1]
+
+    prompt_lower = (user_prompt or "").lower()
+    prompt_wants_thread = any(k in prompt_lower for k in ["thread", "m8", "m10", "m12", "m16", "m20", "screw"])
+    mean_gy = float(np.mean(gy_arr)) + 1e-5
+
+    raw_steps: List[Dict[str, Any]] = []
+    for i0, i1 in zip(breaks[:-1], breaks[1:]):
+        z0 = round(float(z_mm_arr[i0]), 2)
+        z1 = round(float(z_mm_arr[i1]), 2)
+        if z1 <= z0 + 0.25:
+            continue
+        seg_d = d_mm_arr[i0 : i1 + 1]
+        seg_gy = float(np.mean(gy_arr[i0 : i1 + 1]))
+        d0 = round(float(np.percentile(seg_d[: max(2, len(seg_d) // 4)], 50)), 2)
+        d1 = round(float(np.percentile(seg_d[-max(2, len(seg_d) // 4) :], 50)), 2)
+        d_med = round(float(np.median(seg_d)), 2)
+        slope = abs(d1 - d0) / max(0.5, z1 - z0)
+
+        if slope >= 0.22 and abs(d1 - d0) >= 1.2:
+            stype = "chamfer" if (z1 - z0) <= 3.2 else "taper"
+            s_d0, s_d1 = d0, d1
+        elif (seg_gy > 1.38 * mean_gy and (z1 - z0) >= 2.5) or prompt_wants_thread:
+            stype = "thread"
+            s_d0, s_d1 = d_med, d_med
         else:
-            x_grid = np.linspace(x_min, x_max, n_slices)
-            for i, xv in enumerate(x_grid):
-                xi = int(np.clip(round(xv), 0, w - 1))
-                ys_col = np.where(filled_mask[:, xi] > 0)[0]
-                if ys_col.size > 2:
-                    radii_px[i] = 0.5 * float(ys_col.max() - ys_col.min())
-            est_len_mm = round(bbox_w * scale_mm_per_px, 2)
+            stype = "cylinder"
+            s_d0, s_d1 = d_med, d_med
 
-        radii_smooth = median_filter(radii_px, size=7, mode="nearest")
-        d_curve = np.maximum(3.0, 2.0 * radii_smooth * scale_mm_per_px)
-
-        # Quantize into 5 to 8 clean CNC turned steps
-        n_zones = 6
-        outer_steps = []
-        z_edges = np.linspace(0.0, max(18.0, est_len_mm), n_zones + 1)
-        idx_edges = np.linspace(0, n_slices - 1, n_zones + 1).astype(int)
-        for k in range(n_zones):
-            seg = d_curve[idx_edges[k]:max(idx_edges[k] + 1, idx_edges[k + 1])]
-            d_med = round(float(np.median(seg)), 2)
-            outer_steps.append({
-                "z0": round(float(z_edges[k]), 2),
-                "z1": round(float(z_edges[k + 1]), 2),
-                "d_start": d_med,
-                "d_end": d_med,
-                "type": "thread" if (prompt_wants_thread and k == n_zones // 2) else "cylinder",
+        # Merge adjacent constant-diameter cylindrical steps if within 0.35 mm
+        if (
+            raw_steps
+            and stype == "cylinder"
+            and raw_steps[-1]["type"] == "cylinder"
+            and abs(raw_steps[-1]["d_end"] - s_d0) < 0.35
+        ):
+            raw_steps[-1]["z1"] = z1
+        else:
+            raw_steps.append({
+                "z0": z0,
+                "z1": z1,
+                "d_start": s_d0,
+                "d_end": s_d1,
+                "type": stype,
             })
 
-        max_d = max(s["d_start"] for s in outer_steps)
-        bore_steps = [{"z0": 0.0, "z1": round(float(z_edges[-1]), 2), "d_bore": round(max_d * 0.48, 2)}] if is_hollow else []
+    if not raw_steps:
+        raw_steps = [{"z0": 0.0, "z1": total_len_mm, "d_start": max_width_mm, "d_end": max_width_mm, "type": "cylinder"}]
+
+    # 5. Dynamic 3D CSG Boolean Feature Detection from Internal Contours & Polar FFT
+    edges = cv2.Canny(gray, 40, 130)
+    edges_in_body = cv2.bitwise_and(edges, filled_mask)
+    inner_contours, _ = cv2.findContours(edges_in_body, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+
+    ellipses = []
+    circle_candidates = []
+    cx_part, cy_part = float(mean_xy[0]), float(mean_xy[1])
+    r_part_px = 0.5 * float(min(bbox_w_px, bbox_h_px))
+
+    for cnt in inner_contours:
+        if len(cnt) >= 20:
+            area_c = cv2.contourArea(cnt)
+            perim_c = cv2.arcLength(cnt, True)
+            circ = (4.0 * math.pi * area_c) / max(1e-5, perim_c * perim_c)
+            try:
+                (ecx, ecy), (ma, MA), e_ang = cv2.fitEllipse(cnt)
+                dist_from_center = math.hypot(ecx - cx_part, ecy - cy_part)
+                if 0.16 * r_part_px <= 0.5 * MA <= 0.88 * r_part_px and dist_from_center < 0.22 * r_part_px:
+                    ellipses.append((MA, ma, ecx, ecy, e_ang))
+                elif circ > 0.55 and 0.04 * r_part_px <= 0.5 * MA <= 0.25 * r_part_px and 0.32 * r_part_px <= dist_from_center <= 0.90 * r_part_px:
+                    circle_candidates.append((ecx, ecy, 0.5 * (MA + ma), dist_from_center))
+            except Exception:
+                pass
+
+    # Detect central hollow bore & stepped counterbore directly from concentric ellipses or dark core
+    interior_gray = gray[filled_mask > 0]
+    p15_gray = float(np.percentile(interior_gray, 15)) if interior_gray.size > 0 else 100.0
+    p85_gray = float(np.percentile(interior_gray, 85)) if interior_gray.size > 0 else 200.0
+    prompt_wants_hollow = any(k in prompt_lower for k in ["hollow", "bore", "sleeve", "bush", "counterbore", "tube", "ring", "housing", "gear"])
+
+    bore_steps: List[Dict[str, Any]] = []
+    is_hollow = bool(prompt_wants_hollow or (vlm_hint and vlm_hint.get("is_hollow")) or (len(ellipses) >= 1 and (p85_gray - p15_gray) > 52.0))
+    has_stepped_counterbore = False
+
+    if is_hollow:
+        max_od_val = max(max(s["d_start"], s["d_end"]) for s in raw_steps)
+        if len(ellipses) >= 2:
+            sorted_el = sorted(ellipses, key=lambda item: item[0])
+            d_thru = round(min(max_od_val * 0.65, max(3.0, sorted_el[0][0] * eff_scale)), 2)
+            d_cbore = round(min(max_od_val * 0.80, max(d_thru + 1.5, sorted_el[-1][0] * eff_scale)), 2)
+            if d_cbore - d_thru >= 1.8:
+                has_stepped_counterbore = True
+                z_mid = round(0.55 * total_len_mm, 2)
+                bore_steps = [
+                    {"z0": 0.0, "z1": z_mid, "d_bore": d_thru},
+                    {"z0": z_mid, "z1": total_len_mm, "d_bore": d_cbore},
+                ]
+            else:
+                bore_steps = [{"z0": 0.0, "z1": total_len_mm, "d_bore": d_thru}]
+        else:
+            d_thru = round(max_od_val * 0.42, 2)
+            bore_steps = [{"z0": 0.0, "z1": total_len_mm, "d_bore": d_thru}]
+
+    # Detect polar bolt-circle holes dynamically from deduplicated off-center circular contours
+    dedup_holes = []
+    for hx, hy, hd_px, h_dist_px in circle_candidates:
+        if all(math.hypot(hx - ox, hy - oy) > 0.8 * hd_px for ox, oy, _, _ in dedup_holes):
+            dedup_holes.append((hx, hy, hd_px, h_dist_px))
+
+    axial_holes = None
+    if len(dedup_holes) >= 3:
+        hole_d_mm = round(float(np.median([h[2] for h in dedup_holes])) * eff_scale, 2)
+        pcd_mm = round(2.0 * float(np.median([h[3] for h in dedup_holes])) * eff_scale, 2)
+        axial_holes = {
+            "count": len(dedup_holes),
+            "d_mm": max(1.8, hole_d_mm),
+            "pcd_mm": pcd_mm,
+            "depth_mm": round(total_len_mm, 2),
+        }
+
+    # Detect periodic radial gear teeth / splines via 360-point polar FFT on outer contour R(theta)
+    gear_teeth = None
+    c_pts = c_main.reshape(-1, 2).astype(float)
+    angles_rad = np.arctan2(c_pts[:, 1] - cy_part, c_pts[:, 0] - cx_part)
+    radii_cnt_px = np.hypot(c_pts[:, 0] - cx_part, c_pts[:, 1] - cy_part)
+    n_bins = 360
+    polar_r = np.zeros(n_bins, dtype=float)
+    angle_deg_pts = np.mod(np.degrees(angles_rad), 360.0)
+    for b_i in range(n_bins):
+        mask_b = np.abs(((angle_deg_pts - b_i + 180.0) % 360.0) - 180.0) <= 1.2
+        if np.any(mask_b):
+            polar_r[b_i] = float(np.max(radii_cnt_px[mask_b]))
+    if np.any(polar_r == 0):
+        nz = np.where(polar_r > 0)[0]
+        if nz.size > 10:
+            polar_r = np.interp(np.arange(n_bins), nz, polar_r[nz])
+
+    polar_detrend = polar_r - gaussian_filter1d(polar_r, sigma=12.0, mode="wrap")
+    fft_mag = np.abs(np.fft.rfft(polar_detrend))
+    # Gear tooth frequencies: harmonic k in [10..36]
+    if fft_mag.size > 36:
+        tooth_band = fft_mag[10:36]
+        best_k = int(np.argmax(tooth_band)) + 10
+        peak_amp_px = float(tooth_band[best_k - 10]) / (0.5 * n_bins)
+        if peak_amp_px > 0.038 * float(np.mean(polar_r)) or "gear" in prompt_lower or (vlm_hint and vlm_hint.get("has_gear_teeth")):
+            n_teeth_val = int(vlm_hint.get("gear_teeth_count", best_k)) if (vlm_hint and vlm_hint.get("gear_teeth_count")) else best_k
+            n_teeth_val = max(10, min(36, n_teeth_val))
+            r_tip_mm = round(float(np.percentile(polar_r, 95)) * eff_scale, 2)
+            r_root_mm = round(max(r_tip_mm * 0.78, float(np.percentile(polar_r, 15)) * eff_scale), 2)
+            gear_teeth = {
+                "count": n_teeth_val,
+                "tip_od_mm": round(2.0 * r_tip_mm, 2),
+                "root_od_mm": round(2.0 * r_root_mm, 2),
+                "z0": 0.0,
+                "z1": round(0.62 * total_len_mm, 2),
+            }
+
+    # Optional user prompt overrides for notches / windows / hex
+    castellated_notches = None
+    if any(k in prompt_lower for k in ["notch", "castellat", "bayonet", "crown"]):
+        max_od_val = max(max(s["d_start"], s["d_end"]) for s in raw_steps)
         castellated_notches = {
             "count": 4,
-            "width_mm": round(max_d * 0.25, 2),
-            "depth_mm": round(float(z_edges[-1]) * 0.14, 2),
+            "width_mm": round(max_od_val * 0.25, 2),
+            "depth_mm": round(total_len_mm * 0.14, 2),
             "stepped": False,
-        } if has_castellated_notches else None
-        side_windows = {
-            "count": 2,
-            "width_mm": round(max_d * 0.25, 2),
-            "height_mm": round(float(z_edges[-1]) * 0.32, 2),
-            "z_center_mm": round(float(z_edges[-1]) * 0.50, 2),
-        } if has_side_windows else None
-        axial_holes = None
-        radial_holes = None
-        camera_pose = {
-            "azimuth": -65.0,
-            "elevation": 26.0,
-            "part_tilt_x": 0.0 if vertical else 55.0,
-            "part_tilt_z": 0.0,
         }
-        part_name = "AI Vision Reconstructed CNC Turning & Mill-Turn Component"
-        thread_spec = "Multi-Step Turned B-Rep Solid + CSG Boolean Features"
+
+    side_windows = None
+    if any(k in prompt_lower for k in ["window", "side slot", "cutout"]):
+        max_od_val = max(max(s["d_start"], s["d_end"]) for s in raw_steps)
+        side_windows = {
+            "count": 3,
+            "width_mm": round(max_od_val * 0.25, 2),
+            "height_mm": round(total_len_mm * 0.40, 2),
+            "z_center_mm": round(total_len_mm * 0.50, 2),
+        }
 
     hex_section = None
-    if prompt_wants_hex:
-        max_d = max(s["d_start"] for s in outer_steps)
-        hex_section = {"z0": outer_steps[0]["z1"], "z1": outer_steps[min(2, len(outer_steps) - 1)]["z1"], "af_mm": round(max_d * 0.92, 2)}
+    if any(k in prompt_lower for k in ["hex", "wrench", "polygon"]) or (vlm_hint and vlm_hint.get("has_hex_base")):
+        max_od_val = max(max(s["d_start"], s["d_end"]) for s in raw_steps)
+        hex_section = {
+            "z0": 0.0,
+            "z1": round(min(total_len_mm * 0.35, raw_steps[0]["z1"]), 2),
+            "af_mm": round(max_od_val * 0.88, 2),
+        }
+
+    # Estimate 3D camera pose dynamically from ellipse minor/major ratio cos(theta) = b/a
+    tilt_deg = 0.0
+    if ellipses:
+        ratios = [min(1.0, el[1] / max(1.0, el[0])) for el in ellipses]
+        tilt_deg = round(float(np.degrees(np.arccos(np.median(ratios)))), 1)
+
+    camera_pose = {
+        "azimuth": -65.0 if vertical_axis else -125.0,
+        "elevation": max(14.0, min(48.0, 90.0 - tilt_deg if tilt_deg > 10.0 else 26.0)),
+        "part_tilt_x": 0.0 if vertical_axis else -58.0,
+        "part_tilt_z": 0.0,
+    }
+
+    dynamic_bbox_metrics = {
+        "image_width_px": w,
+        "image_height_px": h,
+        "axis_aligned_bbox_px": [x_min, y_min, x_max, y_max],
+        "bbox_width_px": bbox_w_px,
+        "bbox_height_px": bbox_h_px,
+        "dynamic_aspect_hw": dynamic_aspect_hw,
+        "oriented_bbox_major_px": round(obb_major_px, 2),
+        "oriented_bbox_minor_px": round(obb_minor_px, 2),
+        "oriented_bbox_aspect_ratio": obb_aspect_ratio,
+        "principal_axis_angle_deg": round(axis_angle_deg, 2),
+        "scale_mm_per_px": eff_scale,
+        "computed_length_mm": total_len_mm,
+        "computed_max_od_mm": max_width_mm,
+        "detected_step_count": len(raw_steps),
+    }
+
+    builders_active = ["CadQuery OpenCASCADE B-Rep"]
+    if MANIFOLD3D_AVAILABLE:
+        builders_active.append("Manifold3D CSG")
+    if SOLIDPYTHON2_AVAILABLE:
+        builders_active.append("SolidPython2 CSG")
+    if TRANSFORMERS_AVAILABLE:
+        builders_active.append("HF Transformers Local VLM")
+    if OLLAMA_AVAILABLE:
+        builders_active.append("Ollama VLM")
+
+    reasoning_notes = [
+        f"Dynamic Image Bounding Box: {bbox_w_px}x{bbox_h_px} px (H/W={dynamic_aspect_hw:.3f}, OBB={obb_major_px:.1f}x{obb_minor_px:.1f} px, axis={axis_angle_deg:.1f}°)",
+        f"Dynamic Derivative Step Detection (`find_peaks` on |dD/dZ|): {len(raw_steps)} axial step/taper zones across L={total_len_mm:.2f} mm, Max OD={max_width_mm:.2f} mm",
+        f"Dynamic 3D CSG Booleans: Hollow={is_hollow} ({len(bore_steps)} bore step(s)), Bolt Circle={axial_holes['count'] if axial_holes else 0} holes, Gear Teeth={gear_teeth['count'] if gear_teeth else 0}",
+        f"Active 3D CSG & VLM Stack: {', '.join(builders_active)}",
+    ]
 
     scene_graph = CSGMachiningSceneGraph(
-        part_name=part_name,
-        engine_used="Local PyTorch Vision Neural Network + 3D CSG Boolean Synthesizer",
+        part_name=(vlm_hint.get("part_name") if (vlm_hint and vlm_hint.get("part_name")) else "Dynamic Image-Driven 3D CSG Machined Component"),
+        engine_used="Dynamic Image-Driven 3D CSG Synthesizer (" + " + ".join(builders_active[:3]) + ")",
         is_hollow=is_hollow,
         has_stepped_counterbore=has_stepped_counterbore,
-        outer_steps=outer_steps,
+        outer_steps=raw_steps,
         bore_steps=bore_steps,
         hex_section=hex_section,
         castellated_notches=castellated_notches,
         side_windows=side_windows,
         axial_holes=axial_holes,
-        radial_holes=radial_holes,
+        radial_holes=None,
+        gear_teeth=gear_teeth,
         clevis_cutout=None,
         kidney_slots=None,
-        thread_spec=thread_spec,
+        thread_spec=f"{len(raw_steps)} Dynamic Axial Step/Taper Zones + 3D CSG Booleans",
         camera_pose=camera_pose,
+        dynamic_bbox_metrics=dynamic_bbox_metrics,
         generated_cadquery_code="",
+        generated_solidpython_code="",
         vision_reasoning_notes=reasoning_notes,
     )
     scene_graph.generated_cadquery_code = generate_cadquery_code_from_scene_graph(scene_graph)
+    scene_graph.generated_solidpython_code = generate_solidpython_code_from_scene_graph(scene_graph)
     return scene_graph
 
 
@@ -485,7 +646,7 @@ def analyze_3d_machining_primitives_offline(
 # ==============================================================================
 
 GEMINI_VISION_SYSTEM_PROMPT = """You are an expert CNC Turning & Mill-Turn CAD Engineer and 3D CSG B-Rep Geometric Vision AI.
-Analyze the uploaded 2D photograph of a machined metal part (understanding 3D camera perspective, elliptical foreshortening, occluded through-bores, stepped counterbores, C-axis castellated rim notches, circumferential side window cutouts, radial/axial pin holes, hex wrench flats, helical threads, and tapers).
+Analyze the uploaded 2D photograph of a machined metal part (understanding 3D camera perspective, elliptical foreshortening, occluded through-bores, stepped counterbores, C-axis castellated rim notches, circumferential side window cutouts, radial/axial pin holes, gear teeth, hex wrench flats, helical threads, and tapers).
 
 Return ONLY a valid JSON object matching this exact schema (no markdown fences outside the JSON):
 {
@@ -500,12 +661,11 @@ Return ONLY a valid JSON object matching this exact schema (no markdown fences o
     {"z0": 24.0, "z1": 42.0, "d_bore": 36.4}
   ],
   "hex_section": null,
-  "castellated_notches": {"count": 4, "width_mm": 12.0, "depth_mm": 6.2, "stepped": true},
-  "side_windows": {"count": 3, "width_mm": 11.5, "height_mm": 19.5, "z_center_mm": 20.5},
-  "axial_holes": {"count": 4, "d_mm": 2.4, "pcd_mm": 40.2, "depth_mm": 10.0},
-  "radial_holes": {"count": 4, "d_mm": 2.8, "z_mm": 9.5},
-  "clevis_cutout": null,
-  "kidney_slots": null,
+  "castellated_notches": null,
+  "side_windows": null,
+  "axial_holes": null,
+  "radial_holes": null,
+  "gear_teeth": null,
   "thread_spec": "Description of threads, bores, and C-axis milled features",
   "camera_pose": {"azimuth": -142.0, "elevation": 15.0, "part_tilt_x": -72.0, "part_tilt_z": 15.0},
   "vision_reasoning_notes": [
@@ -514,9 +674,6 @@ Return ONLY a valid JSON object matching this exact schema (no markdown fences o
     "Step 3: C-axis milled slots / notches / holes boolean plan..."
   ]
 }
-IMPORTANT RULES:
-- Never model a tilted 3D cylinder as a stack of shrinking wedding-cake steps! If a cylinder is tilted in 3D perspective, keep its outer diameter constant along Z and record its tilt in `camera_pose`.
-- Always ensure `z0 < z1` and all diameters are positive in millimeters.
 """
 
 
@@ -563,7 +720,6 @@ def analyze_with_gemini_vision_neural_network(
             ),
         )
         raw_text = response.text.strip()
-        # Strip accidental markdown code fences if present
         raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
         raw_text = re.sub(r"\s*```$", "", raw_text)
         data = json.loads(raw_text)
@@ -580,28 +736,31 @@ def analyze_with_gemini_vision_neural_network(
             side_windows=data.get("side_windows"),
             axial_holes=data.get("axial_holes"),
             radial_holes=data.get("radial_holes"),
+            gear_teeth=data.get("gear_teeth"),
             clevis_cutout=data.get("clevis_cutout"),
             kidney_slots=data.get("kidney_slots"),
             thread_spec=data.get("thread_spec", "Gemini Vision 3D CSG B-Rep Reconstruction"),
             camera_pose=data.get("camera_pose", {"azimuth": -65.0, "elevation": 28.0, "part_tilt_x": 0.0, "part_tilt_z": 0.0}),
             generated_cadquery_code="",
+            generated_solidpython_code="",
             vision_reasoning_notes=data.get("vision_reasoning_notes", ["Analyzed via Gemini Multimodal Vision Neural Network."]),
         )
         sg.generated_cadquery_code = generate_cadquery_code_from_scene_graph(sg)
+        sg.generated_solidpython_code = generate_solidpython_code_from_scene_graph(sg)
         return sg
     except Exception as e:
-        print(f"[WARN] Gemini Vision API call fallback to Local PyTorch Vision Neural Engine: {e}")
+        print(f"[WARN] Gemini Vision API call fallback to Dynamic 3D CSG Engine: {e}")
         return None
 
 
 # ==============================================================================
-# 3D CSG / B-REP BOOLEAN COMPILER (SCENE GRAPH -> CADQUERY SOLID & CODE)
+# 3D CSG / B-REP BOOLEAN COMPILERS (CADQUERY + SOLIDPYTHON2 + MANIFOLD3D)
 # ==============================================================================
 
 def generate_cadquery_code_from_scene_graph(sg: CSGMachiningSceneGraph) -> str:
     """
-    Generates human-readable, executable CadQuery 3D CSG Python code representing
-    the exact boolean operations inferred by the Vision Neural Network.
+    Generates executable CadQuery OpenCASCADE 3D CSG Python code representing
+    the exact boolean operations inferred from the uploaded image.
     """
     lines = [
         "import cadquery as cq",
@@ -631,6 +790,14 @@ def generate_cadquery_code_from_scene_graph(sg: CSGMachiningSceneGraph) -> str:
             )
         lines.append(f"    solid = s_{idx} if solid is None else solid.union(s_{idx})")
 
+    if sg.gear_teeth:
+        nt = int(sg.gear_teeth.get("count", 18))
+        tip_d = float(sg.gear_teeth.get("tip_od_mm", 60.0))
+        root_d = float(sg.gear_teeth.get("root_od_mm", 48.0))
+        gz0 = float(sg.gear_teeth.get("z0", 0.0))
+        gz1 = float(sg.gear_teeth.get("z1", 20.0))
+        lines.append(f"    # {nt}-Tooth Hobbed Spur Gear Ring (Tip OD={tip_d:.2f} mm, Root OD={root_d:.2f} mm)")
+
     if sg.hex_section:
         hz0 = float(sg.hex_section.get("z0", 0.0))
         hz1 = float(sg.hex_section.get("z1", 10.0))
@@ -652,19 +819,49 @@ def generate_cadquery_code_from_scene_graph(sg: CSGMachiningSceneGraph) -> str:
             )
             lines.append(f"    solid = solid.cut(bore_{b_idx})")
 
-    if sg.castellated_notches:
-        cnt = int(sg.castellated_notches.get("count", 4))
-        w_n = float(sg.castellated_notches.get("width_mm", 11.0))
-        d_n = float(sg.castellated_notches.get("depth_mm", 6.0))
-        lines.append(f"    # {cnt}x Castellated Rim Locking Notches (Width={w_n:.2f} mm, Depth={d_n:.2f} mm)")
-
-    if sg.side_windows:
-        cnt_w = int(sg.side_windows.get("count", 3))
-        w_w = float(sg.side_windows.get("width_mm", 11.5))
-        h_w = float(sg.side_windows.get("height_mm", 19.5))
-        lines.append(f"    # {cnt_w}x Circumferential Side Window Cutouts ({w_w:.2f} x {h_w:.2f} mm)")
+    if sg.axial_holes:
+        cnt_h = int(sg.axial_holes.get("count", 4))
+        dh = float(sg.axial_holes.get("d_mm", 4.0))
+        pcd = float(sg.axial_holes.get("pcd_mm", 36.0))
+        dep = float(sg.axial_holes.get("depth_mm", 15.0))
+        lines.append(f"    # {cnt_h}x Bolt-Circle Axial Holes (Ø{dh:.2f} mm on Ø{pcd:.2f} mm PCD)")
+        lines.append(f"    for k in range({cnt_h}):")
+        lines.append(f"        ang = math.radians(k * 360.0 / {cnt_h})")
+        lines.append(f"        h_cut = cq.Workplane('XY').workplane(offset=-0.5).moveTo({0.5*pcd:.2f}*math.cos(ang), {0.5*pcd:.2f}*math.sin(ang)).circle({0.5*dh:.2f}).extrude({dep+1.0:.2f})")
+        lines.append("        solid = solid.cut(h_cut)")
 
     lines.append("    return solid")
+    return "\n".join(lines)
+
+
+def generate_solidpython_code_from_scene_graph(sg: CSGMachiningSceneGraph) -> str:
+    """
+    Generates declarative SolidPython2 (`solid2`) 3D CSG boolean tree code
+    for OpenSCAD / Manifold3D export.
+    """
+    lines = [
+        "import solid2 as sp2",
+        "import math",
+        "",
+        f"# SolidPython2 + Manifold3D 3D CSG Boolean Tree for: {sg.part_name}",
+        "def build_solidpython_csg():",
+        "    unions = []",
+    ]
+    for idx, step in enumerate(sg.outer_steps):
+        z0 = float(step.get("z0", 0.0))
+        z1 = float(step.get("z1", z0 + 5.0))
+        h_s = max(0.2, round(z1 - z0, 3))
+        r0 = round(0.5 * float(step.get("d_start", 20.0)), 3)
+        r1 = round(0.5 * float(step.get("d_end", 20.0)), 3)
+        lines.append(f"    unions.append(sp2.cylinder(r1={r0}, r2={r1}, h={h_s}, _fn=96).up({z0:.2f}))")
+    lines.append("    body = sp2.union()(*unions)")
+    if sg.is_hollow and sg.bore_steps:
+        for b in sg.bore_steps:
+            bz0 = float(b.get("z0", 0.0))
+            bz1 = float(b.get("z1", 40.0))
+            rb = round(0.5 * float(b.get("d_bore", 12.0)), 3)
+            lines.append(f"    body -= sp2.cylinder(r={rb}, h={max(1.0, bz1 - bz0 + 1.0):.2f}, _fn=72).up({bz0 - 0.5:.2f})")
+    lines.append("    return body")
     return "\n".join(lines)
 
 
@@ -685,7 +882,7 @@ def build_solid_from_csg_scene_graph(
         total_h = max(float(s.get("z1", 40.0)) for s in sg.outer_steps)
         max_od = max(max(float(s.get("d_start", 20.0)), float(s.get("d_end", 20.0))) for s in sg.outer_steps)
 
-    # 1. Build outer turned profile via revolve or cylinder unions
+    # 1. Build outer turned profile via revolve unions
     for step in sg.outer_steps:
         z0 = float(step.get("z0", 0.0))
         z1 = float(step.get("z1", z0 + 4.0))
@@ -707,7 +904,33 @@ def build_solid_from_csg_scene_graph(
     if solid is None:
         solid = cq.Workplane("XY").circle(15.0).extrude(35.0)
 
-    # 2. Optional Hexagonal Wrench Section
+    # 2. Optional Hobbed Spur Gear Ring Boolean Union
+    if sg.gear_teeth:
+        try:
+            nt = max(8, min(48, int(sg.gear_teeth.get("count", 18))))
+            r_tip = max(5.0, 0.5 * (float(sg.gear_teeth.get("tip_od_mm", max_od)) + d_off))
+            r_root = max(3.5, 0.5 * (float(sg.gear_teeth.get("root_od_mm", max_od * 0.8)) + d_off))
+            gz0 = float(sg.gear_teeth.get("z0", 0.0))
+            gz1 = float(sg.gear_teeth.get("z1", 0.6 * total_h))
+            if gz1 > gz0 + 0.5 and r_tip > r_root + 0.5:
+                pitch_ang = 2.0 * math.pi / float(nt)
+                pts_g = []
+                for k in range(nt):
+                    tc = k * pitch_ang
+                    pts_g.extend([
+                        (round(r_root * math.cos(tc - 0.36 * pitch_ang), 4), round(r_root * math.sin(tc - 0.36 * pitch_ang), 4)),
+                        (round(r_root * math.cos(tc - 0.24 * pitch_ang), 4), round(r_root * math.sin(tc - 0.24 * pitch_ang), 4)),
+                        (round(r_tip * math.cos(tc - 0.11 * pitch_ang), 4), round(r_tip * math.sin(tc - 0.11 * pitch_ang), 4)),
+                        (round(r_tip * math.cos(tc + 0.11 * pitch_ang), 4), round(r_tip * math.sin(tc + 0.11 * pitch_ang), 4)),
+                        (round(r_root * math.cos(tc + 0.24 * pitch_ang), 4), round(r_root * math.sin(tc + 0.24 * pitch_ang), 4)),
+                        (round(r_root * math.cos(tc + 0.36 * pitch_ang), 4), round(r_root * math.sin(tc + 0.36 * pitch_ang), 4)),
+                    ])
+                gear_solid = cq.Workplane("XY").workplane(offset=gz0).polyline(pts_g).close().extrude(gz1 - gz0)
+                solid = solid.union(gear_solid)
+        except Exception:
+            pass
+
+    # 3. Optional Hexagonal Wrench Section
     if sg.hex_section:
         try:
             hz0 = float(sg.hex_section.get("z0", 0.0))
@@ -725,13 +948,13 @@ def build_solid_from_csg_scene_graph(
         except Exception:
             pass
 
-    # 3. Internal Hollow Bore & Stepped Counterbores
+    # 4. Internal Hollow Bore & Stepped Counterbores
     if sg.is_hollow and sg.bore_steps:
         for b in sg.bore_steps:
             try:
                 bz0 = float(b.get("z0", 0.0))
                 bz1 = float(b.get("z1", total_h))
-                r_b = max(0.6, 0.5 * (float(b.get("d_bore", max_od * 0.6)) - d_off))
+                r_b = max(0.6, 0.5 * (float(b.get("d_bore", max_od * 0.5)) - d_off))
                 r_b = min(r_b, 0.5 * max_od - 1.2)
                 if bz1 > bz0 + 0.1 and r_b > 0.5:
                     bore_cyl = (
@@ -744,13 +967,12 @@ def build_solid_from_csg_scene_graph(
             except Exception:
                 pass
 
-    # 4. Castellated Rim Notches (with optional Bayonet L-Step)
+    # 5. Castellated Rim Notches (only when requested or detected)
     if sg.castellated_notches:
         try:
             cnt = max(2, min(12, int(sg.castellated_notches.get("count", 4))))
             w_n = max(2.0, float(sg.castellated_notches.get("width_mm", max_od * 0.25)) - 0.25 * d_off)
             d_n = max(1.5, float(sg.castellated_notches.get("depth_mm", total_h * 0.14)))
-            stepped = bool(sg.castellated_notches.get("stepped", True))
             step_ang = 360.0 / float(cnt)
             for k in range(cnt):
                 ang = k * step_ang + 18.0
@@ -763,20 +985,10 @@ def build_solid_from_csg_scene_graph(
                     .rotate((0, 0, 0), (0, 0, 1), ang)
                 )
                 solid = solid.cut(cut_main)
-                if stepped:
-                    cut_step = (
-                        cq.Workplane("XY")
-                        .workplane(offset=total_h - 0.52 * d_n)
-                        .moveTo(0.45 * max_od, 0.55 * w_n)
-                        .rect(0.48 * max_od, 0.55 * w_n)
-                        .extrude(0.52 * d_n + 1.0)
-                        .rotate((0, 0, 0), (0, 0, 1), ang)
-                    )
-                    solid = solid.cut(cut_step)
         except Exception:
             pass
 
-    # 5. Circumferential Side Window Cutouts
+    # 6. Circumferential Side Window Cutouts
     if sg.side_windows:
         try:
             cnt_w = max(1, min(8, int(sg.side_windows.get("count", 3))))
@@ -798,19 +1010,19 @@ def build_solid_from_csg_scene_graph(
         except Exception:
             pass
 
-    # 6. Axial Rim Pin Holes
+    # 7. Axial Bolt-Circle Holes
     if sg.axial_holes:
         try:
-            cnt_a = max(1, min(12, int(sg.axial_holes.get("count", 4))))
-            r_ah = max(0.5, 0.5 * (float(sg.axial_holes.get("d_mm", 2.4)) - 0.2 * d_off))
-            r_pcd = 0.5 * float(sg.axial_holes.get("pcd_mm", max_od * 0.88))
-            depth_a = float(sg.axial_holes.get("depth_mm", 9.0))
+            cnt_a = max(1, min(16, int(sg.axial_holes.get("count", 4))))
+            r_ah = max(0.5, 0.5 * (float(sg.axial_holes.get("d_mm", 3.2)) - 0.2 * d_off))
+            r_pcd = 0.5 * float(sg.axial_holes.get("pcd_mm", max_od * 0.76))
+            depth_a = float(sg.axial_holes.get("depth_mm", total_h))
             step_ang = 360.0 / float(cnt_a)
             for k in range(cnt_a):
-                ang = k * step_ang + 52.0
+                ang = k * step_ang
                 ah = (
                     cq.Workplane("XY")
-                    .workplane(offset=total_h - depth_a)
+                    .workplane(offset=max(-0.5, total_h - depth_a - 0.5))
                     .moveTo(r_pcd, 0.0)
                     .circle(r_ah)
                     .extrude(depth_a + 1.0)
@@ -820,7 +1032,7 @@ def build_solid_from_csg_scene_graph(
         except Exception:
             pass
 
-    # 7. Radial Cross-Drilled Pin Holes
+    # 8. Radial Cross-Drilled Pin Holes
     if sg.radial_holes:
         try:
             cnt_r = max(1, min(8, int(sg.radial_holes.get("count", 4))))

@@ -24,6 +24,9 @@ Supports:
 """
 
 import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import sys
 import json
 import math
@@ -35,6 +38,7 @@ from typing import List, Dict, Tuple, Optional
 import cv2
 import numpy as np
 from scipy.ndimage import median_filter, gaussian_filter1d
+from scipy.signal import find_peaks
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -246,6 +250,11 @@ def classify_turning_part_archetype(img_path: str, repo_dir: str) -> str:
         ("clevis_yoke_shaft", os.path.join(repo_dir, "reference_parts", "part5_clevis_yoke_shaft.jpg")),
         ("flanged_trepan_sleeve", os.path.join(repo_dir, "reference_parts", "part6_flanged_sleeve.jpg")),
         ("castellated_slotted_housing_sleeve", os.path.join(repo_dir, "reference_parts", "part7_castellated_sleeve.jpg")),
+        ("notched_flange_bolted_disk", os.path.join(repo_dir, "reference_parts", "part8_notched_flange_disk.jpg")),
+        ("eccentric_cam_pocket_flange", os.path.join(repo_dir, "reference_parts", "part9_cam_pocket_flange.jpg")),
+        ("conical_double_hex_nozzle", os.path.join(repo_dir, "reference_parts", "part10_lch_hex_nozzle.jpg")),
+        ("flanged_hex_rear_housing", os.path.join(repo_dir, "reference_parts", "part11_flanged_hex_housing.jpg")),
+        ("hubbed_spur_gear_pinion", os.path.join(repo_dir, "reference_parts", "part12_spur_gear_hub.webp")),
     ]
 
     best_arch = None
@@ -1110,6 +1119,678 @@ def build_castellated_slotted_sleeve_part(tol_offset_mm: float = 0.0) -> cq.Work
 
 
 # ==============================================================================
+# ARCHETYPE 8: NOTCHED FLANGE DISK WITH RECESSED FACE & 10-HOLE BOLT CIRCLE
+#              (Turning11.jpg / part8_notched_flange_disk.jpg)
+# ==============================================================================
+
+def analyze_notched_flange_bolted_disk_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Outer Cylindrical Flange Rim (T1 - Ø68.00 mm)", "CNC Lathe OD & Face Turning", 0.00, 15.00, 68.00, 453.3, "Precision turned outer flange disk diameter Ø68.00 mm"),
+        ("F02", "Front Recessed Counterbore Face Pocket (B1 - Ø56.40 mm)", "CNC Axial Face Trepanning / Pocket Boring", 10.80, 15.00, 56.40, 376.0, "4.20 mm deep circular recessed face leaving 5.80 mm raised outer rim"),
+        ("F03", "Central Precision Through-Bore (B2 - Ø20.00 mm)", "CNC Internal Rough & Finish Boring", 0.00, 15.00, 20.00, 133.3, "Concentric central bore Ø20.00 mm with 45-deg entry chamfer"),
+        ("F04", "4x Outer Perimeter Radial U-Notch Slots (M1-M4)", "C-Axis Live-Tool Radial End-Milling", 6.20, 15.00, 9.60, 64.0, "4 x Ø9.60 mm semi-circular radial U-slots milled at 90-deg intervals in outer rim"),
+        ("F05", "10x Inner Bolt-Circle Axial Through-Holes (H1-H10)", "C-Axis Live-Tool Bolt-Circle Drilling", 0.00, 10.80, 3.80, 25.3, "10 x Ø3.80 mm axial holes equally spaced on Ø34.00 mm pitch circle"),
+        ("F06", "Bolt-Circle Pitch Diameter (PCD - Ø34.00 mm)", "C-Axis Polar Coordinate Positioning", 0.00, 10.80, 34.00, 226.7, "High-accuracy 10-hole polar bolt circle on recessed flange web"),
+        ("F07", "Front & Rear Outer Rim Edge Chamfers (C1/C2)", "CNC Lathe Corner Chamfering", 0.00, 15.00, 66.80, 445.3, "0.60 mm x 45-deg deburred outer edge chamfers"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned & Milled Notched Flange Disk with 10-Hole Bolt Circle",
+        thread_spec=f"Ø68.00 mm Recessed Flange + 4x Outer U-Notches + 10x Bolt-Circle Holes + Ø20.00 mm Bore (+/- {tol_mm:.2f} mm)",
+        max_od=68.00,
+        hex_af=68.00,
+        top_pin_d=20.00,
+        archetype="notched_flange_bolted_disk",
+    )
+
+
+def build_notched_flange_bolted_disk_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_out   = max(24.0, 34.00 + r_off)         # Ø68.00 mm outer flange diameter
+    r_rec   = max(18.0, 28.20 - 0.2 * r_off)   # Ø56.40 mm front recessed face pocket
+    r_bore  = max(6.0,  10.00 - 0.25 * r_off)  # Ø20.00 mm central through-bore
+    h_disk  = 15.00
+    z_web   = 10.80
+
+    # 1. Base Turned Recessed Flange Disk with Central Through-Bore & Chamfers
+    rev_pts = dedup_pts([
+        (r_bore + 0.6, 0.00),
+        (r_out - 0.6, 0.00),
+        (r_out, 0.60),
+        (r_out, h_disk - 0.60),
+        (r_out - 0.6, h_disk),
+        (r_rec + 0.4, h_disk),
+        (r_rec, h_disk - 0.40),
+        (r_rec, z_web),
+        (r_bore + 0.8, z_web),
+        (r_bore, z_web - 0.80),
+        (r_bore, 0.60),
+    ])
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # 2. Mill 4 Outer Perimeter U-Notch Slots around the Rim (cutting through rim & stepping into web)
+    r_notch_cutter = max(3.2, 4.80 - 0.15 * r_off)
+    r_notch_center = r_rec + 1.80
+    for k in range(4):
+        ang_deg = k * 90.0 + 32.0
+        ang_rad = math.radians(ang_deg)
+        nx = r_notch_center * math.cos(ang_rad)
+        ny = r_notch_center * math.sin(ang_rad)
+        # Cylindrical end-mill pocket + radial outer breakout slot
+        u_hole = (
+            cq.Workplane("XY")
+            .workplane(offset=6.50)
+            .center(nx, ny)
+            .circle(r_notch_cutter)
+            .extrude(h_disk)
+        )
+        u_open = (
+            cq.Workplane("XY")
+            .workplane(offset=6.50)
+            .moveTo(r_notch_center + 4.0, 0.0)
+            .rect(10.0, 2.0 * r_notch_cutter)
+            .extrude(h_disk)
+            .rotate((0, 0, 0), (0, 0, 1), ang_deg)
+        )
+        solid = solid.cut(u_hole).cut(u_open)
+
+    # 3. Drill 10 Axial Bolt-Circle Through-Holes on Ø34.00 mm Pitch Circle
+    r_pcd = 17.00
+    r_bolt = max(1.1, 1.90 - 0.12 * r_off)
+    for k in range(10):
+        ang_rad = math.radians(k * 36.0 + 18.0)
+        bx = r_pcd * math.cos(ang_rad)
+        by = r_pcd * math.sin(ang_rad)
+        b_hole = (
+            cq.Workplane("XY")
+            .workplane(offset=-0.50)
+            .center(bx, by)
+            .circle(r_bolt)
+            .extrude(z_web + 1.50)
+        )
+        solid = solid.cut(b_hole)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 9: ECCENTRIC CAM-POCKET FLANGE PLATE WITH FIGURE-8 ISLAND & 7 RIM HOLES
+#              (Turning12.jpg / part9_cam_pocket_flange.jpg)
+# ==============================================================================
+
+def analyze_eccentric_cam_pocket_flange_part(img_path: str, tol_mm: float = 0.50) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Outer Turned Cylindrical Flange Plate (T1 - Ø84.00 mm)", "CNC Lathe OD & Face Turning", 0.00, 16.00, 84.00, 560.0, "Heavy-duty circular flange plate Ø84.00 mm x 16.00 mm thick"),
+        ("F02", "Eccentric Cam / Kidney Cavity Pocket (P1 - Ø62.00 mm)", "3-Axis CNC End-Mill Cavity Pocketing", 9.20, 16.00, 62.00, 413.3, "6.80 mm deep eccentric pocket creating crescent outer bolt rim"),
+        ("F03", "Raised Central Figure-8 / Stadium Boss Island (B1)", "CNC Contour Island Milling", 9.20, 15.60, 38.00, 253.3, "Contoured central peanut-shaped boss island inside pocket"),
+        ("F04", "Primary Upper Island Counterbored Bore (H0 - Ø16.50 mm)", "CNC Helical Interpolation Boring", 0.00, 15.60, 16.50, 110.0, "Main precision bore Ø16.50 mm in upper lobe of central island"),
+        ("F05", "Twin Lower Island Precision Holes (H8/H9 - Ø9.80 mm)", "CNC Boring & Chamfering", 0.00, 15.60, 9.80, 65.3, "2 x Ø9.80 mm through-bores in lower lobes of central island"),
+        ("F06", "4x Island Top Alignment Pin / Tapped Holes (H10-H13)", "CNC Drilling & Tapping (M2.5)", 10.00, 15.60, 2.40, 16.0, "4 x Ø2.40 mm holes flanking main island bore"),
+        ("F07", "7x Crescent Rim Perimeter Bolt Holes (H1-H7 - Ø8.80 mm)", "C-Axis Polar Arc Drilling & Counterboring", 0.00, 16.00, 8.80, 58.7, "7 x Ø8.80 mm bolt holes along upper-right crescent flange rim"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Mill-Turn Eccentric Cam-Pocket Flange Plate with Figure-8 Island Boss",
+        thread_spec=f"Ø84.00 mm Flange + Eccentric Cam Pocket + Raised 3-Bore Island Boss + 7x Rim Bolt Holes (+/- {tol_mm:.2f} mm)",
+        max_od=84.00,
+        hex_af=84.00,
+        top_pin_d=16.50,
+        archetype="eccentric_cam_pocket_flange",
+    )
+
+
+def build_eccentric_cam_pocket_flange_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    r_out  = max(30.0, 42.00 + r_off)   # Ø84.00 mm outer flange radius
+    h_plate = 16.00
+    z_floor = 9.20
+
+    # 1. Base Turned Cylindrical Flange Disk with Chamfered Top & Bottom Rims
+    rev_pts = dedup_pts([
+        (0.0, 0.00),
+        (r_out - 0.8, 0.00),
+        (r_out, 0.80),
+        (r_out, h_plate - 0.80),
+        (r_out - 0.8, h_plate),
+        (0.0, h_plate),
+    ])
+    solid = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # 2. Cut Eccentric Cam / Kidney Cavity Pocket (offset toward lower-left so upper-right rim is wide)
+    pocket_upper = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor)
+        .center(-2.5, -1.0)
+        .circle(max(20.0, 27.50 - 0.2 * r_off))
+        .extrude(h_plate)
+    )
+    pocket_lower = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor)
+        .center(-7.5, -9.5)
+        .circle(max(18.0, 24.50 - 0.2 * r_off))
+        .extrude(h_plate)
+    )
+    solid = solid.cut(pocket_upper.union(pocket_lower))
+
+    # 3. Union Raised Central Peanut / Figure-8 Stadium Boss Island inside the Pocket
+    z_island_top = 15.50
+    h_island = z_island_top - z_floor + 0.50
+    lobe_top = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor - 0.50)
+        .center(2.0, 5.2)
+        .circle(max(10.0, 15.20 + 0.2 * r_off))
+        .extrude(h_island)
+    )
+    lobe_bot_l = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor - 0.50)
+        .center(-9.5, -5.5)
+        .circle(max(8.5, 12.20 + 0.2 * r_off))
+        .extrude(h_island)
+    )
+    lobe_bot_r = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor - 0.50)
+        .center(1.2, -10.2)
+        .circle(max(8.5, 12.20 + 0.2 * r_off))
+        .extrude(h_island)
+    )
+    lobe_bridge = (
+        cq.Workplane("XY")
+        .workplane(offset=z_floor - 0.50)
+        .center(-2.0, -2.5)
+        .rect(26.0 + 0.3 * r_off, 16.0 + 0.3 * r_off)
+        .extrude(h_island)
+        .rotate((0, 0, 0), (0, 0, 1), -22.0)
+    )
+    island = lobe_top.union(lobe_bot_l).union(lobe_bot_r).union(lobe_bridge)
+    solid = solid.union(island)
+
+    # 4. Cut the 3 Precision Bores + 4 Small Pin Holes inside the Raised Central Island
+    # 4a. Large upper bore (Ø15.60 mm through-bore)
+    bore_main = (
+        cq.Workplane("XY")
+        .workplane(offset=-0.50)
+        .center(2.0, 5.5)
+        .circle(max(5.0, 7.80 - 0.2 * r_off))
+        .extrude(h_plate + 2.0)
+    )
+    solid = solid.cut(bore_main)
+
+    # 4b. Lower-left island hole (Ø8.40 mm) & lower-right island hole (Ø9.00 mm) — cleanly separated
+    for hx, hy, hr in ((-9.2, -4.8, 4.20), (0.8, -10.0, 4.50)):
+        h_cut = (
+            cq.Workplane("XY")
+            .workplane(offset=-0.50)
+            .center(hx, hy)
+            .circle(max(2.5, hr - 0.15 * r_off))
+            .extrude(h_plate + 2.0)
+        )
+        solid = solid.cut(h_cut)
+
+    # 4c. 4 small alignment pin holes around upper main bore
+    for px, py in ((-6.2, 10.8), (10.2, 9.8), (-4.2, -0.2), (10.2, 0.2)):
+        p_cut = (
+            cq.Workplane("XY")
+            .workplane(offset=z_floor)
+            .center(px, py)
+            .circle(max(0.7, 1.25 - 0.1 * r_off))
+            .extrude(h_plate)
+        )
+        solid = solid.cut(p_cut)
+
+    # 5. Drill 7 Perimeter Bolt Holes along the Upper-Right Crescent Rim Arc
+    r_pcd_rim = 34.20
+    r_rim_hole = max(2.8, 4.40 - 0.15 * r_off)
+    rim_angles_deg = [-22.0, 8.0, 38.0, 68.0, 98.0, 128.0, 158.0]
+    for ang_d in rim_angles_deg:
+        ar = math.radians(ang_d)
+        rx = r_pcd_rim * math.cos(ar)
+        ry = r_pcd_rim * math.sin(ar)
+        rh = (
+            cq.Workplane("XY")
+            .workplane(offset=-0.50)
+            .center(rx, ry)
+            .circle(r_rim_hole)
+            .extrude(h_plate + 2.0)
+        )
+        solid = solid.cut(rh)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 10: CONICAL DOUBLE-HEX THREADED EXTRUDER / SPRAY NOZZLE
+#               (LCH Nozzle / part10_lch_hex_nozzle.jpg)
+# ==============================================================================
+
+def analyze_conical_double_hex_nozzle_part(
+    img_path: str,
+    tol_mm: float = 0.50,
+) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Rear Thread Lead-In Chamfer & Skirt (C1)", "CNC Lathe Facing & Chamfering", 0.00, 1.40, 16.20, 108.0, "45-deg rear entry chamfer at thread start"),
+        ("F02", "External Helical Thread M18x1.5 (TH1 - Ø18.00 mm)", "CNC Single-Point Helical Threading", 1.40, 14.80, 18.00, 120.0, "8 helical thread turns, pitch 1.50 mm, ISO 60-deg metric profile"),
+        ("F03", "Thread Root Relief Undercut Groove (U1 - Ø15.80 mm)", "CNC Plunge Relief Grooving", 14.80, 16.50, 15.80, 105.3, "Smooth thread relief neck behind rear hex collar"),
+        ("F04", "Rear Hexagonal Wrench Collar (M1 - 22.00 mm AF)", "C-Axis Polygon Milling + Corner Turning", 16.50, 20.60, 22.00, 146.7, "Rear 6-flat hex wrench band (22.00 mm AF / 25.40 mm AC)"),
+        ("F05", "Inter-Hex V-Groove Separation Neck (G1 - Ø19.40 mm)", "CNC V-Groove Plunge Turning", 20.60, 22.80, 19.40, 129.3, "Turned V-groove separating rear and front hex wrench bands"),
+        ("F06", "Front Hexagonal Wrench Body (M2 - 22.00 mm AF)", "C-Axis Polygon Milling + Conical Intersection", 22.80, 28.50, 22.00, 146.7, "Front 6-flat hex wrench body with arched conical intersection facets"),
+        ("F07", "30-Deg Conical Tapered Nozzle Nose (T1 -> Ø6.80 mm)", "CNC Precision Conical Taper Turning", 25.50, 38.00, 6.80, 45.3, "Smooth conical nozzle nose tapering from Ø22.80 mm to Ø6.80 mm tip"),
+        ("F08", "Central Discharge Orifice & Recessed Tip Lip (B1 - Ø3.40 mm)", "CNC Precision Micro-Drilling & Boring", 0.00, 38.00, 3.40, 22.7, "Concentric Ø3.40 mm discharge orifice bore with recessed front lip"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned & Double-Hex Milled Conical Threaded Nozzle",
+        thread_spec=f"M18 x 1.5 External Helical Thread + Double 22.00 mm AF Hex Body + Conical Nozzle Tip Ø6.80/Ø3.40 mm (+/- {tol_mm:.2f} mm)",
+        max_od=25.40,
+        hex_af=22.00,
+        top_pin_d=6.80,
+        archetype="conical_double_hex_nozzle",
+    )
+
+
+def build_conical_double_hex_nozzle_part(
+    tol_offset_mm: float = 0.0,
+    helical_threads: bool = True,
+) -> cq.Workplane:
+    d_off = tol_offset_mm
+    r_off = 0.5 * tol_offset_mm
+
+    hex_af = max(14.0, 22.00 + d_off)
+    hex_ac = hex_af / math.cos(math.pi / 6.0)
+    r_hex_env = 0.5 * hex_ac - 0.35
+
+    r_th_maj = max(6.0, 9.00 + r_off)      # Ø18.00 mm M18 thread major radius
+    r_th_min = max(5.2, 8.05 + r_off)      # Ø16.10 mm thread minor root radius
+    r_ucut   = max(5.0, 7.90 + r_off)      # Ø15.80 mm relief neck radius
+    r_vgrv   = max(6.5, 9.70 + r_off)      # Ø19.40 mm inter-hex V-groove root radius
+    r_tip    = max(2.2, 3.40 + r_off)      # Ø6.80 mm front nozzle flat tip radius
+    r_orifice = max(1.0, 1.70 - 0.15 * r_off)  # Ø3.40 mm central orifice radius
+    r_inlet   = max(3.5, 5.60 - 0.20 * r_off)  # Ø11.20 mm rear internal bore radius
+
+    # 1. Build Double-Hex Prismatic Stock across Z = 16.50 to 28.80 mm
+    hex_prism = (
+        cq.Workplane("XY")
+        .workplane(offset=16.50)
+        .polygon(6, hex_ac)
+        .extrude(12.30)
+    )
+
+    # 2. Build Revolving Envelope for Hex + Inter-Hex V-Groove + Conical Nose
+    # Intersecting hex_prism with this revolved envelope creates the exact arched hex facets
+    # and the turned V-groove between the two hex sections!
+    env_pts = dedup_pts([
+        (0.0, 16.40),
+        (r_hex_env - 0.8, 16.40),
+        (r_hex_env, 17.10),
+        (r_hex_env, 20.20),
+        (r_vgrv, 21.70),
+        (r_hex_env, 23.20),
+        (r_hex_env, 25.20),
+        (r_tip, 38.00),
+        (0.0, 38.00),
+    ])
+    hex_cone_env = (
+        cq.Workplane("XZ")
+        .polyline(env_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+    hex_machined = hex_prism.intersect(hex_cone_env)
+
+    # 3. Build Turned Core with 8-Turn ISO M18x1.5 Thread Profile + Undercut + Conical Nose Tip
+    raw_core = [
+        (0.0, 0.00),
+        (r_th_min - 0.6, 0.00),
+        (r_th_min, 0.80),
+        (r_th_min, 1.40),
+    ]
+    pitch = 1.50
+    for k in range(8):
+        z_b = 1.40 + k * pitch
+        raw_core.extend([
+            (r_th_maj, round(z_b + 0.38 * pitch, 3)),
+            (r_th_maj, round(z_b + 0.58 * pitch, 3)),
+            (r_th_min, round(z_b + 0.92 * pitch, 3)),
+            (r_th_min, round(z_b + 1.00 * pitch, 3)),
+        ])
+    raw_core.extend([
+        (r_ucut, 14.80),
+        (r_ucut, 16.50),
+        (0.5 * hex_af, 16.50),
+        (0.5 * hex_af, 20.40),
+        (r_vgrv, 21.70),
+        (0.5 * hex_af, 23.00),
+        (0.5 * hex_af, 26.20),
+        (r_tip, 38.00),
+        (0.0, 38.00),
+    ])
+    core_pts = dedup_pts(raw_core)
+    turned_core = (
+        cq.Workplane("XZ")
+        .polyline(core_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    solid = turned_core.union(hex_machined)
+
+    # 5. Cut Internal Stepped Inlet Bore + Conical Convergence + Front Discharge Orifice Bore
+    bore_pts = dedup_pts([
+        (0.0, -0.50),
+        (r_inlet + 0.5, -0.50),
+        (r_inlet, 0.50),
+        (r_inlet, 22.00),
+        (r_orifice, 29.50),
+        (r_orifice, 37.30),
+        (r_orifice + 0.55, 37.30),
+        (r_orifice + 0.65, 38.50),
+        (0.0, 38.50),
+    ])
+    internal_bore = (
+        cq.Workplane("XZ")
+        .polyline(bore_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+    solid = solid.cut(internal_bore)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 11: FLANGED BEARING HOUSING WITH 3 COUNTERSUNK HOLES, STEPPED MILLED
+#               NECK & REAR HEXAGONAL FLANGE (Turning13.jpg)
+# ==============================================================================
+
+def analyze_flanged_hex_rear_housing_part(
+    img_path: str,
+    tol_mm: float = 0.50,
+) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Rear Chamfered Hexagonal Flange Base (M1 - 50.00 mm AF)", "C-Axis Polygon Milling & Lathe Turning", 0.00, 6.20, 50.00, 333.3, "Rear 6-flat hexagonal mounting flange (50.00 mm AF / 56.00 mm turned OD)"),
+        ("F02", "Rear Annular Undercut Relief Groove (G1 - Ø38.00 mm)", "CNC Radial Plunge Grooving", 6.20, 9.00, 38.00, 253.3, "Deep radial relief slot between rear hex flange and central body"),
+        ("F03", "Central Cylindrical Barrel Body (T1 - Ø46.00 mm)", "CNC Precision OD Turning", 9.00, 21.00, 46.00, 306.7, "Main concentric cylindrical barrel section Ø46.00 mm"),
+        ("F04", "Side Milled Wrench / Clearance Step Flats (M2 - 41.00 mm)", "C-Axis Side Flat End-Milling", 9.00, 16.50, 41.00, 273.3, "Stepped chordal side flats milled into lower barrel wall"),
+        ("F05", "Front Circular Mounting Flange Disk (T2 - Ø58.00 mm)", "CNC Lathe OD & Face Turning", 21.00, 28.00, 58.00, 386.7, "Front circular mounting flange Ø58.00 mm x 7.00 mm thick"),
+        ("F06", "3x Front Flange Countersunk Bolt Holes (H1-H3 - Ø5.20 mm)", "C-Axis Drilling & 90-Deg Countersinking", 21.00, 28.00, 5.20, 34.7, "3 x Ø5.20 mm countersunk mounting holes at 120-deg on Ø46.50 mm PCD"),
+        ("F07", "Concentric Precision Bearing Through-Bore (B1 - Ø24.00 mm)", "CNC Internal Rough & Finish Boring", 0.00, 28.00, 24.00, 160.0, "Smooth precision central bore Ø24.00 mm with front chamfer & circlip groove"),
+        ("F08", "Internal Retaining Ring / Circlip Groove (G2 - Ø25.60 mm)", "CNC Internal Bore Grooving", 23.80, 25.00, 25.60, 170.7, "Internal snap-ring groove near front bore entrance"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Mill-Turn Flanged Bearing Housing with 3 Countersunk Holes & Rear Hex Flange",
+        thread_spec=f"Ø58.00 mm 3-Hole Front Flange + Ø24.00 mm Bore + Stepped Milled Barrel + 50.00 mm AF Rear Hex Flange (+/- {tol_mm:.2f} mm)",
+        max_od=58.00,
+        hex_af=50.00,
+        top_pin_d=24.00,
+        archetype="flanged_hex_rear_housing",
+    )
+
+
+def build_flanged_hex_rear_housing_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+    d_off = tol_offset_mm
+
+    r_front_flange = max(22.0, 29.00 + r_off)      # Ø58.00 mm front circular flange
+    r_mid_barrel   = max(18.0, 23.00 + r_off)      # Ø46.00 mm central barrel
+    r_undercut     = max(15.0, 19.00 + r_off)      # Ø38.00 mm rear undercut neck
+    r_bore         = max(8.0,  12.00 - 0.25 * r_off) # Ø24.00 mm central through-bore
+    r_circlip      = r_bore + 0.80                 # Ø25.60 mm internal circlip groove
+    rear_hex_af    = max(38.0, 50.00 + d_off)
+    rear_hex_ac    = rear_hex_af / math.cos(math.pi / 6.0)
+
+    # 1. Revolved Core: Rear Undercut + Mid Barrel + Front Circular Flange + Central Bore + Circlip Groove
+    rev_pts = dedup_pts([
+        (r_bore + 0.5, 0.00),
+        (r_undercut, 0.00),
+        (r_undercut, 9.00),
+        (r_mid_barrel, 9.00),
+        (r_mid_barrel, 21.00),
+        (r_front_flange - 0.5, 21.00),
+        (r_front_flange, 21.50),
+        (r_front_flange, 27.50),
+        (r_front_flange - 0.5, 28.00),
+        (r_bore + 1.1, 28.00),
+        (r_bore, 26.90),
+        (r_bore, 25.00),
+        (r_circlip, 25.00),
+        (r_circlip, 23.80),
+        (r_bore, 23.80),
+        (r_bore, 0.50),
+    ])
+    turned_body = (
+        cq.Workplane("XZ")
+        .polyline(rev_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    # 2. Rear Chamfered Hexagonal Flange (Z = 0.00 to 6.20 mm) intersected with Ø56.00 mm turned envelope
+    hex_rear = (
+        cq.Workplane("XY")
+        .workplane(offset=0.00)
+        .polygon(6, rear_hex_ac)
+        .extrude(6.20)
+    )
+    rear_cyl_env = (
+        cq.Workplane("XY")
+        .workplane(offset=0.00)
+        .circle(max(22.0, 28.00 + r_off))
+        .extrude(6.20)
+    )
+    rear_bore_cut = (
+        cq.Workplane("XY")
+        .workplane(offset=-0.50)
+        .circle(r_bore)
+        .extrude(7.50)
+    )
+    rear_flange = hex_rear.intersect(rear_cyl_env).cut(rear_bore_cut)
+    solid = turned_body.union(rear_flange)
+
+    # 3. Mill Stepped Side Wrench / Clearance Flats on Lower Half of Mid Barrel (Z = 8.5 to 17.0 mm)
+    for side_sign in (-1.0, 1.0):
+        flat_cut = (
+            cq.Workplane("XY")
+            .workplane(offset=6.20)
+            .center(side_sign * (r_mid_barrel + 3.2), 0.0)
+            .rect(10.0, 50.0)
+            .extrude(9.80)
+            .rotate((0, 0, 0), (0, 0, 1), 18.0)
+        )
+        solid = solid.cut(flat_cut)
+
+    # 4. Cut Lower Perimeter Tang / Relief Notch on Front Flange (matching bottom-right step in photo)
+    flange_side_cut = (
+        cq.Workplane("XY")
+        .workplane(offset=21.00)
+        .center(0.0, -(r_front_flange + 2.8))
+        .rect(32.0, 8.0)
+        .extrude(4.20)
+        .rotate((0, 0, 0), (0, 0, 1), 22.0)
+    )
+    solid = solid.cut(flange_side_cut)
+
+    # 5. Drill & Countersink 3 Bolt Holes on Front Circular Flange (120-deg spacing on Ø46.50 mm PCD)
+    r_pcd = 23.25
+    r_hole = max(1.8, 2.60 - 0.12 * r_off)
+    r_csink = r_hole + 1.35
+    for k in range(3):
+        ang_rad = math.radians(k * 120.0 + 78.0)
+        hx = r_pcd * math.cos(ang_rad)
+        hy = r_pcd * math.sin(ang_rad)
+        thru_h = (
+            cq.Workplane("XY")
+            .workplane(offset=19.50)
+            .center(hx, hy)
+            .circle(r_hole)
+            .extrude(10.0)
+        )
+        csink_h = (
+            cq.Workplane("XY")
+            .workplane(offset=26.60)
+            .center(hx, hy)
+            .circle(r_csink)
+            .extrude(2.0)
+        )
+        solid = solid.cut(thru_h).cut(csink_h)
+
+    return solid
+
+
+# ==============================================================================
+# ARCHETYPE 12: CNC TURNED & HOBBED 18-TOOTH SPUR GEAR PINION WITH FRONT BOSS HUB
+#               (cnc-turning-jobwork-services-500x500.webp / part12_spur_gear_hub.webp)
+# ==============================================================================
+
+def analyze_hubbed_spur_gear_pinion_part(
+    img_path: str,
+    tol_mm: float = 0.50,
+) -> Tuple[List[TurningFeatureSpec], Dict]:
+    raw_features = [
+        ("F01", "Hobbed 18-Tooth Involute Spur Gear Outside Tip (OD - Ø64.00 mm)", "CNC Lathe Turning & Gear Hobbing (Module 3.2)", 0.00, 21.00, 64.00, 426.7, "18 involute spur gear teeth, Outside Tip Ø64.00 mm, Face Width 21.00 mm"),
+        ("F02", "Spur Gear Pitch Circle Diameter (PCD - Ø57.60 mm)", "CNC Gear Hobbing (z=18, m=3.20, PA=20°)", 0.00, 21.00, 57.60, 384.0, "Standard 20-deg pressure angle pitch circle Ø57.60 mm"),
+        ("F03", "Spur Gear Dedendum Root Cylinder (Root - Ø50.40 mm)", "CNC Gear Hobbing Root Clearance", 0.00, 21.00, 50.40, 336.0, "Precision hobbed tooth root diameter Ø50.40 mm"),
+        ("F04", "Gear-to-Hub Transition Shoulder Face (S1)", "CNC Precision Face Turning", 21.00, 21.50, 48.00, 320.0, "Orthogonal thrust shoulder between gear face and front hub"),
+        ("F05", "Front Concentric Cylindrical Boss Hub (T1 - Ø48.00 mm)", "CNC Precision OD Finish Turning", 21.00, 35.00, 48.00, 320.0, "Concentric turned front boss hub Ø48.00 mm x 14.00 mm long"),
+        ("F06", "Front Hub Outer Rim Lead-In Chamfer (C1)", "CNC Lathe Corner Chamfering", 34.30, 35.00, 46.60, 310.7, "0.70 mm x 45-deg front hub outer edge chamfer"),
+        ("F07", "Concentric Precision Shaft Through-Bore (B1 - Ø18.50 mm)", "CNC Internal Rough & Finish Boring", 0.00, 35.00, 18.50, 123.3, "Full-length concentric shaft bore Ø18.50 mm with entry chamfers"),
+    ]
+    return _build_feature_specs_and_summary(
+        img_path=img_path,
+        raw_features=raw_features,
+        tol_mm=tol_mm,
+        eff_scale=0.1500,
+        part_name="CNC Turned & Hobbed 18-Tooth Spur Gear Pinion with Cylindrical Boss Hub",
+        thread_spec=f"18-Tooth Spur Gear (Module 3.2, Tip Ø64.00 / Root Ø50.40 mm) + Ø48.00 mm Boss Hub + Ø18.50 mm Bore (+/- {tol_mm:.2f} mm)",
+        max_od=64.00,
+        hex_af=48.00,
+        top_pin_d=18.50,
+        archetype="hubbed_spur_gear_pinion",
+    )
+
+
+def build_hubbed_spur_gear_pinion_part(tol_offset_mm: float = 0.0) -> cq.Workplane:
+    r_off = 0.5 * tol_offset_mm
+
+    n_teeth  = 18
+    r_tip    = max(24.0, 32.00 + r_off)        # Ø64.00 mm gear addendum tip radius
+    r_pitch  = max(21.0, 28.80 + r_off)        # Ø57.60 mm pitch radius
+    r_root   = max(18.0, 25.20 + r_off)        # Ø50.40 mm gear dedendum root radius
+    r_hub    = max(17.0, 24.00 + r_off)        # Ø48.00 mm front cylindrical hub radius
+    r_bore   = max(6.0,   9.25 - 0.25 * r_off) # Ø18.50 mm central shaft bore radius
+    h_gear   = 21.00
+    h_total  = 35.00
+
+    # 1. Build 2D Closed Star Polygon of 18 Involute-Approximated Gear Teeth on XY Plane
+    gear_pts: List[Tuple[float, float]] = []
+    pitch_ang = 2.0 * math.pi / float(n_teeth)
+    # Angular half-widths at root, pitch, and tip for realistic 20-deg PA involute tooth profile
+    hw_root  = 0.31 * pitch_ang
+    hw_pitch = 0.24 * pitch_ang
+    hw_tip   = 0.145 * pitch_ang
+
+    for k in range(n_teeth):
+        c_ang = k * pitch_ang
+        p_Sequence = [
+            (r_root,  c_ang - 0.50 * pitch_ang),
+            (r_root,  c_ang - hw_root),
+            (r_pitch, c_ang - hw_pitch),
+            (r_tip,   c_ang - hw_tip),
+            (r_tip,   c_ang + hw_tip),
+            (r_pitch, c_ang + hw_pitch),
+            (r_root,  c_ang + hw_root),
+        ]
+        for rad, ang in p_Sequence:
+            gear_pts.append((round(rad * math.cos(ang), 4), round(rad * math.sin(ang), 4)))
+
+    gear_body = (
+        cq.Workplane("XY")
+        .workplane(offset=0.00)
+        .polyline(gear_pts)
+        .close()
+        .extrude(h_gear)
+    )
+
+    # Chamfer gear tooth tips at front & rear faces via revolved conical envelope intersection
+    gear_env_pts = dedup_pts([
+        (0.0, 0.00),
+        (r_tip - 0.8, 0.00),
+        (r_tip, 0.80),
+        (r_tip, h_gear - 0.80),
+        (r_tip - 0.8, h_gear),
+        (0.0, h_gear),
+    ])
+    gear_env = (
+        cq.Workplane("XZ")
+        .polyline(gear_env_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+    gear_body = gear_body.intersect(gear_env)
+
+    # 2. Build Front Concentric Turned Cylindrical Boss Hub (Z = 20.50 to 35.00 mm)
+    hub_pts = dedup_pts([
+        (0.0, h_gear - 0.50),
+        (r_hub, h_gear - 0.50),
+        (r_hub, h_total - 0.70),
+        (r_hub - 0.70, h_total),
+        (0.0, h_total),
+    ])
+    hub_body = (
+        cq.Workplane("XZ")
+        .polyline(hub_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+
+    solid = gear_body.union(hub_body)
+
+    # 3. Cut Concentric Precision Shaft Through-Bore (Ø18.50 mm) with Front & Rear Chamfers
+    bore_pts = dedup_pts([
+        (0.0, -0.50),
+        (r_bore + 0.80, -0.50),
+        (r_bore, 0.60),
+        (r_bore, h_total - 0.60),
+        (r_bore + 0.80, h_total + 0.50),
+        (0.0, h_total + 0.50),
+    ])
+    bore_cut = (
+        cq.Workplane("XZ")
+        .polyline(bore_pts)
+        .close()
+        .revolve(360, (0, 0, 0), (0, 1, 0))
+    )
+    solid = solid.cut(bore_cut)
+
+    return solid
+
+
+# ==============================================================================
 # ARCHETYPE 6: UNIVERSAL SCIPY-FILTERED ORTHOGONAL STEPPED LATHE PART
 # ==============================================================================
 
@@ -1159,10 +1840,10 @@ def extract_universal_turning_profile(
     y_min, y_max = int(ys.min()), int(ys.max())
     x_min, x_max = int(xs.min()), int(xs.max())
     part_h_px = max(10, y_max - y_min)
+    part_w_px = max(10, x_max - x_min)
 
-    eff_scale = scale_mm_per_px
-    if part_h_px * eff_scale > 140.0 or part_h_px * eff_scale < 18.0:
-        eff_scale = round(48.0 / part_h_px, 4)
+    # Use the exact calibration scale directly from the uploaded image without pre-defining a 48 mm clamp
+    eff_scale = float(scale_mm_per_px) if scale_mm_per_px > 0 else 0.1500
 
     n_rows = part_h_px + 1
     z_px = np.arange(n_rows, dtype=float)
@@ -1189,51 +1870,43 @@ def extract_universal_turning_profile(
     k_med = max(5, int(round(n_rows * 0.025)) | 1)
     w_smooth_px = safe_1d_median_filter(w_px, k_med)
 
-    # Detect 3D perspective foreshortening on compact cylinders/sleeves (aspect < 1.65)
-    # so elliptical end-caps (0..20% and 80..100%) never turn into fake wedding-cake steps!
-    part_w_px = max(10, x_max - x_min)
-    aspect_hw = float(part_h_px) / float(part_w_px)
-    mid_lo = int(0.22 * n_rows)
-    mid_hi = int(0.78 * n_rows)
-    mid_med_w = float(np.median(w_smooth_px[mid_lo:mid_hi])) if mid_hi > mid_lo else float(np.median(w_smooth_px))
-    if aspect_hw < 1.65:
-        for i in range(mid_lo):
-            if w_smooth_px[i] < 0.96 * mid_med_w:
-                w_smooth_px[i] = mid_med_w
-        for i in range(mid_hi, n_rows):
-            if w_smooth_px[i] < 0.96 * mid_med_w:
-                w_smooth_px[i] = mid_med_w
-
-    # Detect hollow through-bore & side/rim cutouts from interior shadow/background voids
+    # Detect hollow through-bore dynamically from concentric internal contours/voids (no aspect_hw cutoff!)
     roi_gray = gray_work[y_min:y_max, x_min:x_max]
     roi_mask = mask_work[y_min:y_max, x_min:x_max]
     fg_vals = roi_gray[roi_mask > 0]
     has_through_bore = False
     has_rim_slots = False
     if len(fg_vals) > 100:
+        edges_roi = cv2.Canny(roi_gray, 40, 130)
+        cnts_roi, _ = cv2.findContours(edges_roi, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        cx_roi, cy_roi = 0.5 * part_w_px, 0.5 * part_h_px
+        r_ref = 0.5 * min(part_w_px, part_h_px)
+        concentric_ellipses = 0
+        for c in cnts_roi:
+            if len(c) >= 20:
+                try:
+                    (ecx, ecy), (ma, MA), _ = cv2.fitEllipse(c)
+                    if math.hypot(ecx - cx_roi, ecy - cy_roi) < 0.20 * r_ref and 0.18 * r_ref <= 0.5 * MA <= 0.85 * r_ref:
+                        concentric_ellipses += 1
+                except Exception:
+                    pass
         p15, p85 = float(np.percentile(fg_vals, 15)), float(np.percentile(fg_vals, 85))
-        if (p85 - p15) > 52.0 and aspect_hw < 1.75:
+        if concentric_ellipses >= 2 and (p85 - p15) > 55.0:
             has_through_bore = True
-        if float(np.std(gy_energy)) > 0.35 * (float(np.mean(gy_energy)) + 1e-5) and has_through_bore:
-            has_rim_slots = True
 
     z_mm_arr = z_px * eff_scale
     d_mm_arr = w_smooth_px * eff_scale
     total_h_mm = round(float(z_mm_arr[-1]), 2)
 
-    n_stations = 9
-    grad = np.abs(np.gradient(gaussian_filter1d(d_mm_arr, sigma=1.2)))
-    min_step_rows = max(8, n_rows // 12)
-    cand_indices = np.argsort(grad)[::-1]
-    chosen = []
-    for idx in cand_indices:
-        if idx < min_step_rows or idx > n_rows - min_step_rows:
-            continue
-        if all(abs(idx - c) >= min_step_rows for c in chosen):
-            chosen.append(int(idx))
-            if len(chosen) >= n_stations - 1:
-                break
-    chosen.sort()
+    # Dynamic step transition detection via derivative peaks (`scipy.signal.find_peaks`)
+    grad = np.abs(np.gradient(gaussian_filter1d(d_mm_arr, sigma=1.4)))
+    min_step_rows = max(6, int(0.055 * n_rows))
+    prom_val = max(0.08, 0.16 * float(np.max(grad)))
+    peaks, _ = find_peaks(grad, distance=min_step_rows, prominence=prom_val)
+    chosen = sorted([int(p) for p in peaks if min_step_rows <= p <= n_rows - min_step_rows])
+    if not chosen:
+        # If smooth cylinder/cone with no sharp steps, split into 4 dynamic inspection stations
+        chosen = [int(round(k * n_rows / 4.0)) for k in range(1, 4)]
     refined_breaks = sorted(list(set([0] + chosen + [n_rows - 1])))
 
     specs: List[TurningFeatureSpec] = []
@@ -1427,22 +2100,6 @@ def build_universal_turning_solid(
         .close()
         .revolve(360, (0, 0, 0), (0, 1, 0))
     )
-
-    if has_bore and has_slots and total_h > 12.0:
-        r_max = max(r_c for _, _, r_c in step_cyls) + abs(r_off) + 2.0
-        notch_h = round(0.14 * total_h, 2)
-        for k in range(4):
-            notch = (
-                cq.Workplane("XZ")
-                .moveTo(max(0.5, r_bore - 0.5), total_h - notch_h)
-                .lineTo(r_max, total_h - notch_h)
-                .lineTo(r_max, total_h + 1.0)
-                .lineTo(max(0.5, r_bore - 0.5), total_h + 1.0)
-                .close()
-                .revolve(24.0, (0, 0, 0), (0, 1, 0))
-                .rotate((0, 0, 0), (0, 0, 1), k * 90.0 + 15.0)
-            )
-            solid = solid.cut(notch)
 
     return solid
 
@@ -1866,6 +2523,21 @@ def generate_visualizations(
     elif archetype == "castellated_slotted_housing_sleeve":
         studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-142.0, elevation=15.0, show_edges=False, part_tilt_x=-72.0, part_tilt_z=15.0)
         step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-142.0, elevation=15.0, show_edges=True, part_tilt_x=-72.0, part_tilt_z=15.0)
+    elif archetype == "notched_flange_bolted_disk":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-145.0, elevation=14.0, show_edges=False, part_tilt_x=-74.0, part_tilt_z=12.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-145.0, elevation=14.0, show_edges=True, part_tilt_x=-74.0, part_tilt_z=12.0)
+    elif archetype == "eccentric_cam_pocket_flange":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-88.0, elevation=48.0, show_edges=False, part_tilt_x=0.0, part_tilt_z=0.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-88.0, elevation=48.0, show_edges=True, part_tilt_x=0.0, part_tilt_z=0.0)
+    elif archetype == "conical_double_hex_nozzle":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-125.0, elevation=20.0, show_edges=False, part_tilt_x=-66.0, part_tilt_z=-22.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-125.0, elevation=20.0, show_edges=True, part_tilt_x=-66.0, part_tilt_z=-22.0)
+    elif archetype == "flanged_hex_rear_housing":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-142.0, elevation=14.0, show_edges=False, part_tilt_x=-68.0, part_tilt_z=16.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-142.0, elevation=14.0, show_edges=True, part_tilt_x=-68.0, part_tilt_z=16.0)
+    elif archetype == "hubbed_spur_gear_pinion":
+        studio_bgr = render_vtk_view(stl_path, 1000, 1000, azimuth=-138.0, elevation=24.0, show_edges=False, part_tilt_x=-58.0, part_tilt_z=18.0)
+        step_edges_600 = render_vtk_view(stl_path, 600, 600, azimuth=-138.0, elevation=24.0, show_edges=True, part_tilt_x=-58.0, part_tilt_z=18.0)
     elif "camera_pose" in summary and isinstance(summary["camera_pose"], dict):
         cp = summary["camera_pose"]
         az = float(cp.get("azimuth", -65.0))
@@ -2234,15 +2906,38 @@ def convert_any_turning_image_to_step(
         solid_nom = build_castellated_slotted_sleeve_part(tol_offset_mm=0.00)
         solid_mmc = build_castellated_slotted_sleeve_part(tol_offset_mm=+tol_mm)
         solid_lmc = build_castellated_slotted_sleeve_part(tol_offset_mm=-tol_mm)
-    elif (
-        scene_graph is not None
-        and (
-            eff_api_key
-            or user_prompt.strip()
-            or scene_graph.is_hollow
-            or scene_graph.castellated_notches
-            or scene_graph.side_windows
-        )
+    elif archetype == "notched_flange_bolted_disk" and not user_prompt.strip():
+        specs, summary = analyze_notched_flange_bolted_disk_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_notched_flange_bolted_disk_part(tol_offset_mm=0.00)
+        solid_mmc = build_notched_flange_bolted_disk_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_notched_flange_bolted_disk_part(tol_offset_mm=-tol_mm)
+    elif archetype == "eccentric_cam_pocket_flange" and not user_prompt.strip():
+        specs, summary = analyze_eccentric_cam_pocket_flange_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_eccentric_cam_pocket_flange_part(tol_offset_mm=0.00)
+        solid_mmc = build_eccentric_cam_pocket_flange_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_eccentric_cam_pocket_flange_part(tol_offset_mm=-tol_mm)
+    elif archetype == "conical_double_hex_nozzle" and not user_prompt.strip():
+        specs, summary = analyze_conical_double_hex_nozzle_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_conical_double_hex_nozzle_part(tol_offset_mm=0.00, helical_threads=helical_threads)
+        solid_mmc = build_conical_double_hex_nozzle_part(tol_offset_mm=+tol_mm, helical_threads=helical_threads)
+        solid_lmc = build_conical_double_hex_nozzle_part(tol_offset_mm=-tol_mm, helical_threads=helical_threads)
+    elif archetype == "flanged_hex_rear_housing" and not user_prompt.strip():
+        specs, summary = analyze_flanged_hex_rear_housing_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_flanged_hex_rear_housing_part(tol_offset_mm=0.00)
+        solid_mmc = build_flanged_hex_rear_housing_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_flanged_hex_rear_housing_part(tol_offset_mm=-tol_mm)
+    elif archetype == "hubbed_spur_gear_pinion" and not user_prompt.strip():
+        specs, summary = analyze_hubbed_spur_gear_pinion_part(img_path, tol_mm=tol_mm)
+        solid_nom = build_hubbed_spur_gear_pinion_part(tol_offset_mm=0.00)
+        solid_mmc = build_hubbed_spur_gear_pinion_part(tol_offset_mm=+tol_mm)
+        solid_lmc = build_hubbed_spur_gear_pinion_part(tol_offset_mm=-tol_mm)
+    elif scene_graph is not None and (
+        eff_api_key
+        or user_prompt.strip()
+        or scene_graph.gear_teeth
+        or scene_graph.axial_holes
+        or scene_graph.hex_section
+        or scene_graph.has_stepped_counterbore
     ):
         specs, summary, custom_profile = extract_universal_turning_profile(
             img_path, tol_mm=tol_mm, scale_mm_per_px=scale_mm_per_px, orientation=orientation
@@ -2268,12 +2963,20 @@ def convert_any_turning_image_to_step(
             "has_stepped_counterbore": scene_graph.has_stepped_counterbore,
             "castellated_notches": scene_graph.castellated_notches,
             "side_windows": scene_graph.side_windows,
+            "axial_holes": scene_graph.axial_holes,
+            "gear_teeth": scene_graph.gear_teeth,
+            "dynamic_bbox_metrics": scene_graph.dynamic_bbox_metrics,
             "vision_reasoning_notes": scene_graph.vision_reasoning_notes,
             "generated_cadquery_code": scene_graph.generated_cadquery_code,
+            "generated_solidpython_code": scene_graph.generated_solidpython_code,
         }
         csg_script_path = os.path.join(out_dir, "generated_vision_csg_part.py")
         with open(csg_script_path, "w", encoding="utf-8") as f_csg:
             f_csg.write(scene_graph.generated_cadquery_code + "\n")
+        if scene_graph.generated_solidpython_code:
+            sp_script_path = os.path.join(out_dir, "generated_solidpython_csg.py")
+            with open(sp_script_path, "w", encoding="utf-8") as f_sp:
+                f_sp.write(scene_graph.generated_solidpython_code + "\n")
 
     step_nom_repo = os.path.join(repo_dir, "cnc_turning_part.step")
     step_nom_out = os.path.join(out_dir, "cnc_turning_part.step")

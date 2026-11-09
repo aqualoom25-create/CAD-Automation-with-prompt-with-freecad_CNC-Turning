@@ -11,6 +11,9 @@ Provides an interactive localhost web dashboard with:
 """
 
 import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import json
 import time
 import shutil
@@ -478,6 +481,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <button type="button" class="btn primary" onclick="loadPreset('castellated_sleeve')" title="Load Castellated & Side-Slotted Housing Sleeve (5c6402097f62b5609.jpg)">
                 &#9881; Part 7: Castellated Sleeve
               </button>
+              <button type="button" class="btn amber" onclick="loadPreset('notched_flange_disk')" title="Load Notched Flange Disk with 10-Hole Bolt Circle (Turning11.jpg)">
+                &#9881; Part 8: Notched Flange Disk
+              </button>
+              <button type="button" class="btn primary" onclick="loadPreset('cam_pocket_flange')" title="Load Eccentric Cam-Pocket Flange with Figure-8 Island (Turning12.jpg)">
+                &#9881; Part 9: Cam-Pocket Flange
+              </button>
+              <button type="button" class="btn amber" onclick="loadPreset('lch_hex_nozzle')" title="Load Conical Double-Hex Threaded Nozzle (LCH Nozzle)">
+                &#9881; Part 10: Conical Hex Nozzle
+              </button>
+              <button type="button" class="btn primary" onclick="loadPreset('flanged_hex_housing')" title="Load Flanged Counterbored Housing with 3 Countersunk Holes & Rear Hex Base (Turning13.jpg)">
+                &#9881; Part 11: Flanged Hex Housing
+              </button>
+              <button type="button" class="btn amber" onclick="loadPreset('spur_gear_hub')" title="Load Turned & Hobbed Spur Gear Pinion with Stepped Front Boss (cnc-turning-jobwork-services-500x500.webp)">
+                &#9881; Part 12: Spur Gear Hub
+              </button>
             </div>
           </div>
 
@@ -508,14 +526,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </div>
             </div>
 
-            <div class="form-row" style="grid-template-columns: 1.55fr 1fr; margin-top: 10px;">
+            <div class="form-row" style="grid-template-columns: 1fr; margin-top: 10px;">
               <div class="form-group">
-                <label>&#129504; Vision Neural Prompt (Optional — e.g. "hollow sleeve, 4 front notches, 3 side slots")</label>
-                <input type="text" id="promptInput" name="user_prompt" placeholder="Auto-infer 3D perspective, hollow bore, slots, notches &amp; threads via Vision Neural Network..." />
-              </div>
-              <div class="form-group">
-                <label>&#128273; Gemini Vision API Key (Optional — Offline PyTorch Neural Engine Active by Default)</label>
-                <input type="password" id="geminiKeyInput" name="gemini_api_key" placeholder="AIzaSy... (or leave blank for Local PyTorch Vision)" />
+                <label>&#129504; Local Vision Neural Prompt (Optional — 100% Standalone Offline 3D CSG Engine Active by Default, No API Key Required)</label>
+                <input type="text" id="promptInput" name="user_prompt" placeholder="Auto-infers 3D perspective, bolt circles, pockets, bores, slots, hex flats &amp; threads automatically (or type custom instructions)..." />
               </div>
             </div>
 
@@ -551,22 +565,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       {% if summary.vision_neural_network %}
       <div class="card" style="margin-top: 22px;">
         <div class="card-header">
-          <h2>&#129504; Vision Neural Network 3D Scene Graph &amp; Synthesized CadQuery 3D CSG Boolean Code</h2>
-          <div style="display:flex; gap:8px; align-items:center;">
+          <h2>&#129504; Dynamic Image Bounding-Box &amp; Synthesized 3D CSG Boolean Code (CadQuery + SolidPython2 + Manifold3D)</h2>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <span class="badge green">{{ summary.vision_neural_network.engine_used }}</span>
-            <a class="btn primary" href="/download/generated_vision_csg_part.py">&#11015; Download 3D CSG Python Script (.py)</a>
+            <a class="btn primary" href="/download/generated_vision_csg_part.py">&#11015; CadQuery CSG Script (.py)</a>
+            <a class="btn amber" href="/download/generated_solidpython_csg.py">&#11015; SolidPython2 / Manifold3D CSG (.py)</a>
           </div>
         </div>
         <div style="display:grid; grid-template-columns: 1fr 1.35fr; gap: 16px;">
           <div style="background:#0f172a; border:1px solid var(--border); border-radius:8px; padding:14px;">
             <div style="font-size:0.86rem; font-weight:700; color:var(--accent); margin-bottom:8px;">
-              3D Perspective, Occlusion &amp; Machining Semantics Detected:
+              Dynamic Image-Driven Bounding Box &amp; 3D CSG Primitives:
             </div>
             <ul style="padding-left:18px; font-size:0.83rem; color:#cbd5e1; line-height:1.65;">
+              {% if summary.vision_neural_network.dynamic_bbox_metrics %}
+              <li><strong>Dynamic Pixel BBox &amp; Aspect:</strong> {{ summary.vision_neural_network.dynamic_bbox_metrics.bbox_width_px }}&times;{{ summary.vision_neural_network.dynamic_bbox_metrics.bbox_height_px }} px (Dynamic H/W={{ summary.vision_neural_network.dynamic_bbox_metrics.dynamic_aspect_hw }}, OBB={{ summary.vision_neural_network.dynamic_bbox_metrics.oriented_bbox_aspect_ratio }})</li>
+              {% endif %}
               <li><strong>Hollow Bore / Tube:</strong> {{ "Yes (Through-Bore)" if summary.vision_neural_network.is_hollow else "Solid Shaft" }}</li>
               <li><strong>Stepped Counterbore:</strong> {{ "Yes (Multi-Step Internal Counterbore)" if summary.vision_neural_network.has_stepped_counterbore else "Single Diameter / None" }}</li>
-              <li><strong>Castellated Rim Notches:</strong> {{ summary.vision_neural_network.castellated_notches if summary.vision_neural_network.castellated_notches else "None" }}</li>
-              <li><strong>Circumferential Side Windows:</strong> {{ summary.vision_neural_network.side_windows if summary.vision_neural_network.side_windows else "None" }}</li>
+              <li><strong>Bolt-Circle Holes:</strong> {{ summary.vision_neural_network.axial_holes if summary.vision_neural_network.axial_holes else "None" }}</li>
+              <li><strong>Radial Gear Teeth / Splines:</strong> {{ summary.vision_neural_network.gear_teeth if summary.vision_neural_network.gear_teeth else "None" }}</li>
               {% for note in summary.vision_neural_network.vision_reasoning_notes %}
               <li>{{ note }}</li>
               {% endfor %}
@@ -574,7 +592,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
           <div style="background:#090d16; border:1px solid var(--border); border-radius:8px; padding:12px; overflow-x:auto;">
             <div style="font-size:0.8rem; font-weight:700; color:#4ade80; margin-bottom:6px;">
-              Synthesized 3D CSG / B-Rep Boolean Operations (CadQuery OpenCASCADE):
+              Synthesized 3D CSG / B-Rep Boolean Operations (CadQuery OpenCASCADE + SolidPython2):
             </div>
             <pre style="font-family:Consolas, monospace; font-size:0.78rem; color:#e2e8f0; white-space:pre-wrap; max-height:220px; overflow-y:auto;">{{ summary.vision_neural_network.generated_cadquery_code }}</pre>
           </div>
@@ -809,7 +827,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       formData.append('scale_mm_per_px', document.getElementById('scaleInput').value);
       formData.append('orientation', document.getElementById('orientInput').value);
       formData.append('user_prompt', document.getElementById('promptInput').value);
-      formData.append('gemini_api_key', document.getElementById('geminiKeyInput').value);
 
       try {
         const res = await fetch('/api/upload_convert', {
@@ -1030,6 +1047,11 @@ def api_load_preset(preset_name):
         "clevis_shaft": (os.path.join(BASE_DIR, "reference_parts", "part5_clevis_yoke_shaft.jpg"), 0.1500),
         "flanged_sleeve": (os.path.join(BASE_DIR, "reference_parts", "part6_flanged_sleeve.jpg"), 0.1500),
         "castellated_sleeve": (os.path.join(BASE_DIR, "reference_parts", "part7_castellated_sleeve.jpg"), 0.1500),
+        "notched_flange_disk": (os.path.join(BASE_DIR, "reference_parts", "part8_notched_flange_disk.jpg"), 0.1500),
+        "cam_pocket_flange": (os.path.join(BASE_DIR, "reference_parts", "part9_cam_pocket_flange.jpg"), 0.1500),
+        "lch_hex_nozzle": (os.path.join(BASE_DIR, "reference_parts", "part10_lch_hex_nozzle.jpg"), 0.1500),
+        "flanged_hex_housing": (os.path.join(BASE_DIR, "reference_parts", "part11_flanged_hex_housing.jpg"), 0.1500),
+        "spur_gear_hub": (os.path.join(BASE_DIR, "reference_parts", "part12_spur_gear_hub.webp"), 0.1500),
     }
     target, scale = preset_map.get(preset_name, (os.path.join(BASE_DIR, "reference_turning_part.png"), 0.1500))
     if not os.path.exists(target):
